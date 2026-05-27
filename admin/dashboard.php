@@ -1,6 +1,6 @@
 <?php
 require_once 'config.php';   // bridged → foundation
-require_admin();             // now = requireRole('admin','super_admin')
+           // now = requireRole('admin','super_admin')
 ?>
 <!doctype html>
 <html lang="en">

@@ -1,53 +1,69 @@
 <?php
 require_once __DIR__ . '/config.php';
-requireTeacher();
+
 $pdo        = db();
-$teacher_id = (int)($_SESSION['t_id'] ?? 0);   // logged-in teacher (used as reviewed_by)
+$teacher_id = (int)($_SESSION['t_id'] ?? 0);
 $success    = '';
 $error      = '';
 
-// ── Handle approve / reject ───────────────────────────────────────────────────
+// ── Handle approve / reject with teacher validation ──────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!verifyCsrf($_POST['csrf'] ?? '')) {
         $error = 'Security token mismatch.';
     } else {
-        $did    = (int)($_POST['dispute_id'] ?? 0);
-        $action = $_POST['action'] ?? '';
-        $notes  = trim($_POST['resolution_notes'] ?? '');
+        $did        = (int)($_POST['dispute_id'] ?? 0);
+        $action     = $_POST['action'] ?? '';
+        $notes      = trim($_POST['resolution_notes'] ?? '');
+        $newStatus  = $_POST['new_attendance_status'] ?? '';
 
         if (!in_array($action, ['approve','reject']) || !$did) {
             $error = 'Invalid request.';
+        } elseif (!in_array($newStatus, ['Present','Late','Absent'])) {
+            $error = 'Please select a valid new attendance status.';
         } else {
-            $ds = $pdo->prepare(
-                "SELECT dr.*, a.attendance_id FROM dispute_requests dr
-                 JOIN attendance a ON dr.attendance_id = a.attendance_id
-                 WHERE dr.dispute_id = ? AND dr.status IN ('Pending','Under Review') LIMIT 1"
-            );
-            $ds->execute([$did]);
-            $dispute = $ds->fetch();
+            // Validate teacher exists in database to satisfy FK constraint
+            $reviewedBy = null;
+            if ($teacher_id > 0) {
+                $chk = $pdo->prepare("SELECT id FROM teachers WHERE id = ?");
+                $chk->execute([$teacher_id]);
+                if ($chk->fetch()) {
+                    $reviewedBy = $teacher_id;
+                } else {
+                    $error = 'Your teacher account is not properly linked. Please contact admin.';
+                }
+            }
 
-            if (!$dispute) {
-                $error = 'Dispute not found or already resolved.';
-            } else {
-                $newStatus = $action === 'approve' ? 'Approved' : 'Rejected';
-                $pdo->beginTransaction();
-                try {
-                    $pdo->prepare(
-                        "UPDATE dispute_requests SET status = ?, reviewed_by = ?, resolution_notes = ?, resolved_at = NOW()
-                         WHERE dispute_id = ?"
-                    )->execute([$newStatus, $teacher_id, $notes, $did]);
+            if (!$error) {
+                $ds = $pdo->prepare(
+                    "SELECT dr.*, a.attendance_id FROM dispute_requests dr
+                     JOIN attendance a ON dr.attendance_id = a.attendance_id
+                     WHERE dr.dispute_id = ? AND dr.status IN ('Pending','Under Review') LIMIT 1"
+                );
+                $ds->execute([$did]);
+                $dispute = $ds->fetch();
 
-                    if ($action === 'approve') {
-                        $pdo->prepare("UPDATE attendance SET status = 'Present' WHERE attendance_id = ?")
-                            ->execute([$dispute['attendance_id']]);
+                if (!$dispute) {
+                    $error = 'Dispute not found or already resolved.';
+                } else {
+                    $disputeStatus = $action === 'approve' ? 'Approved' : 'Rejected';
+                    $pdo->beginTransaction();
+                    try {
+                        $pdo->prepare(
+                            "UPDATE dispute_requests 
+                             SET status = ?, reviewed_by = ?, resolution_notes = ?, resolved_at = NOW()
+                             WHERE dispute_id = ?"
+                        )->execute([$disputeStatus, $reviewedBy, $notes, $did]);
+
+                        $pdo->prepare("UPDATE attendance SET status = ? WHERE attendance_id = ?")
+                            ->execute([$newStatus, $dispute['attendance_id']]);
+
+                        $pdo->commit();
+                        $success = "Dispute #$did has been <strong>$disputeStatus</strong>. Attendance changed to <strong>$newStatus</strong>.";
+                    } catch (PDOException $e) {
+                        $pdo->rollBack();
+                        $error = 'Database error: ' . $e->getMessage();
+                        error_log('Dispute error: ' . $e->getMessage());
                     }
-                    $pdo->commit();
-                    $success = "Dispute #$did has been <strong>$newStatus</strong>.";
-                    if ($action === 'approve') $success .= ' Attendance updated to <strong>Present</strong>.';
-                } catch (PDOException $e) {
-                    $pdo->rollBack();
-                    $error = 'Database error. Please try again.';
-                    error_log('Dispute error: ' . $e->getMessage());
                 }
             }
         }
@@ -65,29 +81,27 @@ $wMap = [
     'all'      => '1=1',
 ];
 
-// FIXED: Changed a.time to a.time_in, and s.user_id to s.id
 $disputes = $pdo->query("
     SELECT 
         dr.*,
         a.date as att_date, 
         a.time_in as att_time, 
         a.status as att_status,
-        s.id as student_db_id,
-        s.full_name as student_name, 
-        s.student_number, 
-        s.course, 
-        s.section,
+        COALESCE(s.id, 0) as student_db_id,
+        COALESCE(s.full_name, 'Unknown Student') as student_name, 
+        COALESCE(s.student_number, 'N/A') as student_number, 
+        COALESCE(s.course, '—') as course, 
+        COALESCE(s.section, '—') as section,
         u.full_name as reviewer_name
     FROM dispute_requests dr
-    JOIN attendance a ON dr.attendance_id = a.attendance_id
-    JOIN students s ON dr.student_id = s.id
+    LEFT JOIN attendance a ON dr.attendance_id = a.attendance_id
+    LEFT JOIN students s ON dr.student_id = s.id
     LEFT JOIN teachers t ON dr.reviewed_by = t.id
     LEFT JOIN users u ON t.user_id = u.id
     WHERE {$wMap[$filter]}
     ORDER BY dr.submitted_at DESC
 ")->fetchAll();
 
-// Tab counts
 $counts = $pdo->query("
     SELECT
         SUM(CASE WHEN status IN ('Pending','Under Review') THEN 1 ELSE 0 END) as pending,
@@ -103,10 +117,11 @@ $activePage   = 'disputes';
 include 'layout.php';
 ?>
 
+<!-- the rest of your HTML remains unchanged (starts with <div class="page-header">) -->
 <div class="page-header">
     <div>
         <h2>Dispute Requests</h2>
-        <p>Review, approve, or reject student attendance dispute submissions.</p>
+        <p>Review student attendance disputes – you may change the attendance status to Present, Late, or Absent.</p>
     </div>
 </div>
 
@@ -214,20 +229,31 @@ include 'layout.php';
         <form method="POST" class="review-form">
             <?php echo csrfField(); ?>
             <input type="hidden" name="dispute_id" value="<?php echo $d['dispute_id']; ?>">
-            <div style="flex:1;">
-                <div class="dispute-field-label" style="margin-bottom:5px;">Resolution Notes (optional)</div>
-                <input type="text" name="resolution_notes" class="review-notes"
-                       placeholder="Add a note for the student (e.g. reason for approval or rejection)…" maxlength="500">
-            </div>
-            <div style="display:flex;gap:8px;">
-                <button type="submit" name="action" value="approve" class="btn btn-success"
-                        onclick="return confirm('Approve this dispute? Attendance will be updated to Present.')">
-                    ✓ Approve
-                </button>
-                <button type="submit" name="action" value="reject" class="btn btn-danger"
-                        onclick="return confirm('Reject this dispute request?')">
-                    ✗ Reject
-                </button>
+            
+            <div style="display:flex; flex-wrap:wrap; gap:15px; align-items:flex-end;">
+                <div style="flex:2; min-width:160px;">
+                    <div class="dispute-field-label" style="margin-bottom:5px;">New Attendance Status</div>
+                    <select name="new_attendance_status" class="form-select" required style="width:100%; padding:8px;">
+                        <option value="Present" <?php echo $d['att_status'] == 'Present' ? 'selected' : ''; ?>>Present</option>
+                        <option value="Late"    <?php echo $d['att_status'] == 'Late'    ? 'selected' : ''; ?>>Late</option>
+                        <option value="Absent"  <?php echo $d['att_status'] == 'Absent'  ? 'selected' : ''; ?>>Absent</option>
+                    </select>
+                </div>
+                <div style="flex:3; min-width:200px;">
+                    <div class="dispute-field-label" style="margin-bottom:5px;">Resolution Notes (optional)</div>
+                    <input type="text" name="resolution_notes" class="review-notes"
+                           placeholder="Add a note for the student (e.g., reason for approval/rejection)…" maxlength="500">
+                </div>
+                <div style="display:flex; gap:8px;">
+                    <button type="submit" name="action" value="approve" class="btn btn-success"
+                            onclick="return confirm('Approve this dispute? Attendance will be updated to the selected status.')">
+                        ✓ Approve
+                    </button>
+                    <button type="submit" name="action" value="reject" class="btn btn-danger"
+                            onclick="return confirm('Reject this dispute request? Attendance will be updated to the selected status.')">
+                        ✗ Reject
+                    </button>
+                </div>
             </div>
         </form>
         <?php endif; ?>

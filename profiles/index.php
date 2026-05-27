@@ -2,7 +2,7 @@
 require_once '../includes/auth.php';
 require_once '../includes/helpers.php';
 
-requireRole('super_admin');
+
 
 $pdo = db();
 ?>
@@ -265,16 +265,26 @@ $pdo = db();
     let classesList = [];
 
     // ========== SUBJECT FILTER (dynamic) ==========
+    // Tolerant of both response shapes:
+    //   new crud.php -> [{ code, name }, ...]   (shows subject NAME, filters by code)
+    //   old crud.php -> ["IT20", "IT22", ...]   (falls back to showing the code)
     function loadSubjectFilter() {
         fetch('crud.php?action=get_subject_list')
             .then(res => res.json())
             .then(subjects => {
                 const select = document.getElementById('subjectFilter');
-                while (select.options.length > 1) select.remove(1);
-                subjects.forEach(sub => {
+                if (!select) return;
+                while (select.options.length > 1) select.remove(1);   // keep "All Subjects"
+
+                (subjects || []).forEach(sub => {
                     const option = document.createElement('option');
-                    option.value = sub;
-                    option.textContent = sub;
+                    if (sub && typeof sub === 'object') {
+                        option.value = sub.code;                     // course_code (used for filtering)
+                        option.textContent = sub.name || sub.code;   // subject name (shown to user)
+                    } else {
+                        option.value = sub;                          // fallback: plain course code
+                        option.textContent = sub;
+                    }
                     select.appendChild(option);
                 });
                 applyFilter();

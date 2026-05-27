@@ -1,244 +1,198 @@
-<?php require_once __DIR__ . '/../includes/guard.php'; ?>
 <?php
-$conn = new mysqli("localhost","root","","school_db");
-$ok = $err = "";
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
 
-// Define allowed subjects
-$allowedSubjects = [
-    'Introduction to Human Computer Interaction',
-    'Information Management 1',
-    'Fundamentals of Database Systems',
-    'Quantitative Methods',
-    'Information Assurance & Security 1'
-];
+$configPath = __DIR__ . '/../includes/config.php';
+if (!file_exists($configPath)) {
+    die("config.php not found at: " . $configPath);
+}
+require_once $configPath;
+require_once __DIR__ . '/../includes/auth.php';
 
-if(isset($_POST['submit'])){
+// Roles allowed to manage schedules. Keep this in sync with schedule.php.
+$manageRoles = ['admin', 'super_admin', 'teacher'];
 
-  $s = trim($_POST['subject']); 
-  $c = trim($_POST['course_code']);
-  $t = trim($_POST['teacher']);
-  $d = $_POST['day']; 
-  $st = $_POST['start_time'];
-  $en = $_POST['end_time']; 
-  $r = trim($_POST['room']);
+if (!isLoggedIn() || !in_array(currentUser()['role'], $manageRoles)) {
+    header('Location: schedule.php');
+    exit;
+}
 
-  // Validate subject
-  if(!in_array($s, $allowedSubjects)){
+$pdo = db();
+$success = '';
+$error = '';
 
-    $err = "Invalid subject selected.";
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $subject_name = trim($_POST['subject_name'] ?? '');
+    $course_code  = trim($_POST['course_code'] ?? '');
+    $section      = trim($_POST['section'] ?? '');
+    $teacher_name = trim($_POST['teacher_name'] ?? '');
+    $day          = $_POST['day'] ?? '';
+    $start_time   = $_POST['start_time'] ?? '';
+    $end_time     = $_POST['end_time'] ?? '';
+    $room         = trim($_POST['room'] ?? '');
 
-  } elseif($st >= $en){
-
-    $err = "End time must be greater than start time.";
-
-  } else {
-
-    // CHECK CONFLICT TIME
-    $conflict = $conn->prepare("
-      SELECT * FROM class_schedule
-      WHERE day = ?
-      AND (
-            (? < end_time) 
-            AND 
-            (? > start_time)
-          )
-    ");
-
-    $conflict->bind_param("sss", $d, $st, $en);
-    $conflict->execute();
-    $result = $conflict->get_result();
-
-    if($result->num_rows > 0){
-
-      $err = "Cannot add schedule because that time is already occupied.";
-
+    if (!$subject_name) {
+        $error = 'Please enter a subject name.';
+    } elseif (!$course_code) {
+        $error = 'Please enter a course code.';
+    } elseif (!$section) {
+        $error = 'Please enter a section.';
+    } elseif (!$teacher_name) {
+        $error = 'Please enter the teacher name.';
+    } elseif (!$day) {
+        $error = 'Please select a day.';
+    } elseif (!$start_time || !$end_time) {
+        $error = 'Please provide start and end times.';
+    } elseif (!$room) {
+        $error = 'Please provide a room.';
+    } elseif ($start_time >= $end_time) {
+        $error = 'End time must be after start time.';
     } else {
+        // Room/time conflict check (independent of subject)
+        $stmt = $pdo->prepare("
+            SELECT schedule_id FROM schedules
+            WHERE day = ? AND room = ? AND (
+                (start_time < ? AND end_time > ?) OR
+                (start_time < ? AND end_time > ?) OR
+                (start_time >= ? AND end_time <= ?)
+            )
+        ");
+        $stmt->execute([$day, $room, $end_time, $start_time, $end_time, $start_time, $start_time, $end_time]);
 
-      $q = $conn->prepare("
-        INSERT INTO class_schedule
-        (subject,course_code,teacher,day,start_time,end_time,room)
-        VALUES(?,?,?,?,?,?,?)
-      ");
+        if ($stmt->fetch()) {
+            $error = "Schedule conflict: Room $room already occupied on $day during that time.";
+        } else {
+            try {
+                $pdo->beginTransaction();
 
-      $q->bind_param("sssssss",$s,$c,$t,$d,$st,$en,$r);
+                // 1. Find or create the subject (keyed by course_code).
+                $sub = $pdo->prepare("SELECT course_code FROM subjects WHERE course_code = ?");
+                $sub->execute([$course_code]);
+                if (!$sub->fetch()) {
+                    $pdo->prepare("INSERT INTO subjects (course_code, subject_name) VALUES (?, ?)")
+                        ->execute([$course_code, $subject_name]);
+                }
 
-      if($q->execute()){
-        $ok = "Schedule added!";
-      } else {
-        $err = "Error: ".$conn->error;
-      }
+                // 2. Find or create the teacher (by name). NOTE: this inserts only
+                //    name + subject; it assumes the other teacher columns are nullable
+                //    or have defaults. If your schema is stricter, this will throw a
+                //    "Database error" below and you can tell me which columns to fill.
+                $tq = $pdo->prepare("SELECT id FROM teachers WHERE LOWER(name) = LOWER(?) LIMIT 1");
+                $tq->execute([$teacher_name]);
+                $trow = $tq->fetch();
+                if ($trow) {
+                    $teacher_id = $trow['id'];
+                } else {
+                    $pdo->prepare("INSERT INTO teachers (name, subject) VALUES (?, ?)")
+                        ->execute([$teacher_name, $subject_name]);
+                    $teacher_id = $pdo->lastInsertId();
+                }
 
-      $q->close();
+                // 3. Find or create the class (course_code + section) and make sure
+                //    the chosen teacher is assigned to it.
+                $cls = $pdo->prepare("SELECT class_id FROM classes WHERE course_code = ? AND section = ?");
+                $cls->execute([$course_code, $section]);
+                $row = $cls->fetch();
+                if ($row) {
+                    $class_id = $row['class_id'];
+                    $pdo->prepare("UPDATE classes SET teacher_id = ? WHERE class_id = ?")
+                        ->execute([$teacher_id, $class_id]);
+                } else {
+                    $pdo->prepare("INSERT INTO classes (course_code, section, teacher_id) VALUES (?, ?, ?)")
+                        ->execute([$course_code, $section, $teacher_id]);
+                    $class_id = $pdo->lastInsertId();
+                }
+
+                // 4. Insert the schedule.
+                $pdo->prepare("INSERT INTO schedules (class_id, day, start_time, end_time, room) VALUES (?, ?, ?, ?, ?)")
+                    ->execute([$class_id, $day, $start_time, $end_time, $room]);
+
+                $pdo->commit();
+                $success = 'Schedule added successfully!';
+                $_POST = [];
+            } catch (PDOException $e) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                $error = 'Database error: ' . $e->getMessage();
+            }
+        }
     }
-
-    $conflict->close();
-  }
 }
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1.0">
-  <title>Add Schedule</title>
-  <link rel="stylesheet" href="styles.css">
+    <meta charset="UTF-8">
+    <title>Add Schedule</title>
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-
 <nav class="topnav">
-  <a href="index.php" class="logo">
-    <div class="logo-dot">S</div> Schedule
-  </a>
-  <a href="schedule.php" class="nav-back">&larr; Schedule</a>
+    <a href="index.php" class="logo"><div class="logo-dot">S</div> Schedule</a>
+    <a href="schedule.php" class="nav-back">&larr; Schedule</a>
 </nav>
-
 <div class="page page-sm">
-
-  <div style="margin-bottom:24px;">
     <div class="page-title">Add Class Schedule</div>
-    <div class="page-sub">Select from 5 major subjects</div>
-  </div>
+    <div class="page-sub">Type the class details, then assign a time slot and room</div>
 
-  <?php if($ok): ?>
-    <div class="alert ok">
-      &#10003; <?=htmlspecialchars($ok)?>
-      &nbsp;<a href="schedule.php">View all &rarr;</a>
-    </div>
-  <?php endif; ?>
+    <?php if ($success): ?>
+        <div class="alert ok">✓ <?= htmlspecialchars($success) ?> <a href="schedule.php">View all schedules &rarr;</a></div>
+    <?php endif; ?>
+    <?php if ($error): ?>
+        <div class="alert err">⚠ <?= htmlspecialchars($error) ?></div>
+    <?php endif; ?>
 
-  <?php if($err): ?>
-    <div class="alert err">
-      &#9888; <?=htmlspecialchars($err)?>
-    </div>
-  <?php endif; ?>
-
-  <div class="card">
-    <div class="card-body">
-
-      <form method="POST">
-
-        <div class="fg">
-
-          <div class="f full">
-            <label for="subject">Subject *</label>
-
-            <select id="subject" name="subject" required>
-              <option value="">-- Select Subject --</option>
-
-              <?php foreach($allowedSubjects as $subj): ?>
-                <option value="<?=htmlspecialchars($subj)?>"
-                  <?=isset($_POST['subject']) && $_POST['subject']===$subj ? 'selected' : ''?>>
-
-                  <?=htmlspecialchars($subj)?>
-
-                </option>
-              <?php endforeach; ?>
-            </select>
-          </div>
-
-          <div class="f">
-            <label for="course_code">Course Code</label>
-
-            <input
-              type="text"
-              id="course_code"
-              name="course_code"
-              placeholder="e.g. ITC 15"
-              value="<?=isset($_POST['course_code']) ? htmlspecialchars($_POST['course_code']) : ''?>"
-            >
-
-            <small style="font-size:11px;color:var(--ink3);display:block;margin-top:4px;">
-              Optional - e.g., ITC 15, IT 16
-            </small>
-          </div>
-
-          <div class="f">
-            <label for="teacher">Instructor *</label>
-
-            <input
-              type="text"
-              id="teacher"
-              name="teacher"
-              placeholder="e.g. Intud, RB"
-              required
-              value="<?=isset($_POST['teacher']) ? htmlspecialchars($_POST['teacher']) : ''?>"
-            >
-          </div>
-
-          <div class="f">
-            <label for="room">Room *</label>
-
-            <input
-              type="text"
-              id="room"
-              name="room"
-              placeholder="e.g. A28"
-              required
-              value="<?=isset($_POST['room']) ? htmlspecialchars($_POST['room']) : ''?>"
-            >
-          </div>
-
-          <div class="f">
-            <label for="day">Day *</label>
-
-            <select id="day" name="day" required>
-
-              <?php foreach(['Monday','Tuesday','Wednesday','Thursday','Friday'] as $dv): ?>
-
-                <option value="<?=$dv?>"
-                  <?=isset($_POST['day']) && $_POST['day']===$dv ? 'selected' : ''?>>
-
-                  <?=$dv?>
-
-                </option>
-
-              <?php endforeach; ?>
-
-            </select>
-          </div>
-
-          <div class="f">
-            <label for="start_time">Start Time *</label>
-
-            <input
-              type="time"
-              id="start_time"
-              name="start_time"
-              required
-              value="<?=isset($_POST['start_time']) ? htmlspecialchars($_POST['start_time']) : ''?>"
-            >
-          </div>
-
-          <div class="f">
-            <label for="end_time">End Time *</label>
-
-            <input
-              type="time"
-              id="end_time"
-              name="end_time"
-              required
-              value="<?=isset($_POST['end_time']) ? htmlspecialchars($_POST['end_time']) : ''?>"
-            >
-          </div>
-
+    <div class="card">
+        <div class="card-body">
+            <form method="POST">
+                <div class="fg">
+                    <div class="f full">
+                        <label>Subject Name *</label>
+                        <input type="text" name="subject_name" required placeholder="e.g. Introduction to Programming" value="<?= htmlspecialchars($_POST['subject_name'] ?? '') ?>">
+                    </div>
+                    <div class="f">
+                        <label>Course Code *</label>
+                        <input type="text" name="course_code" required placeholder="e.g. CS101" value="<?= htmlspecialchars($_POST['course_code'] ?? '') ?>">
+                    </div>
+                    <div class="f">
+                        <label>Section *</label>
+                        <input type="text" name="section" required placeholder="e.g. BSIT-1A" value="<?= htmlspecialchars($_POST['section'] ?? '') ?>">
+                    </div>
+                    <div class="f full">
+                        <label>Teacher Name *</label>
+                        <input type="text" name="teacher_name" required placeholder="e.g. Juan Dela Cruz" value="<?= htmlspecialchars($_POST['teacher_name'] ?? '') ?>">
+                    </div>
+                    <div class="f">
+                        <label>Day *</label>
+                        <select name="day" required>
+                            <option value="">-- Select Day --</option>
+                            <?php foreach (['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'] as $d): ?>
+                                <option value="<?= $d ?>" <?= (isset($_POST['day']) && $_POST['day'] == $d) ? 'selected' : '' ?>><?= $d ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="f">
+                        <label>Start Time *</label>
+                        <input type="time" name="start_time" required value="<?= htmlspecialchars($_POST['start_time'] ?? '') ?>">
+                    </div>
+                    <div class="f">
+                        <label>End Time *</label>
+                        <input type="time" name="end_time" required value="<?= htmlspecialchars($_POST['end_time'] ?? '') ?>">
+                    </div>
+                    <div class="f">
+                        <label>Room *</label>
+                        <input type="text" name="room" required placeholder="e.g. COM LAB A" value="<?= htmlspecialchars($_POST['room'] ?? '') ?>">
+                    </div>
+                </div>
+                <div class="form-foot">
+                    <button type="submit" class="btn btn-blue">➕ Add Schedule</button>
+                    <a href="schedule.php" class="btn btn-ghost">Cancel</a>
+                </div>
+            </form>
         </div>
-
-        <div class="form-foot">
-          <button type="submit" name="submit" class="btn btn-blue">
-            Add Schedule
-          </button>
-
-          <a href="schedule.php" class="btn btn-ghost">
-            View All
-          </a>
-        </div>
-
-      </form>
-
     </div>
-  </div>
-
 </div>
-
 </body>
 </html>

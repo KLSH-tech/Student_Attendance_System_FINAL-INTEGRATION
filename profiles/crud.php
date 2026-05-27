@@ -9,14 +9,29 @@ header('Content-Type: application/json');
 
 require_once __DIR__ . '/../includes/auth.php';
 
-if (!isLoggedIn() || !in_array(currentUser()['role'], ['admin', 'super_admin'], true)) {
+if (!isLoggedIn()) {
     http_response_code(403);
-    echo json_encode(['status' => 'error', 'message' => 'Not authorized']);
+    echo json_encode(['status' => 'error', 'message' => 'Not authenticated']);
     exit;
 }
 
+$user = currentUser();
+$role = $user['role'] ?? '';
+$isAdmin = in_array($role, ['admin', 'super_admin'], true);
+
 $pdo = db();
 $action = $_POST['action'] ?? $_GET['action'] ?? '';
+
+// Define actions that require admin privileges (write operations)
+$adminOnly = [
+    'add_student', 'update_profile', 'delete_student',
+    'add_teacher', 'update_teacher', 'delete_teacher'
+];
+if (in_array($action, $adminOnly) && !$isAdmin) {
+    http_response_code(403);
+    echo json_encode(['status' => 'error', 'message' => 'Admin rights required for this action']);
+    exit;
+}
 
 try {
     switch ($action) {
@@ -72,6 +87,9 @@ try {
 
         // ========== READ: classes + schedules (for add‑student dropdown) ==========
         case 'get_classes':
+            // NOTE: COALESCE so classes whose class_code is NULL (e.g. those created
+            // by add_schedule.php) are NOT silently excluded. `NULL != 'A28'` is not
+            // TRUE in SQL, which previously dropped every newly added class.
             $stmt = $pdo->query("
                 SELECT c.class_id, sub.course_code AS subject_code, sub.subject_name, c.section,
                        sch.schedule_id, sch.day, 
@@ -82,21 +100,87 @@ try {
                 JOIN schedules sch ON sch.class_id = c.class_id
                 LEFT JOIN teachers t ON c.teacher_id = t.id
                 LEFT JOIN users u ON t.user_id = u.id
-                WHERE c.class_code != 'A28'
+                WHERE COALESCE(c.class_code, '') != 'A28'
                 ORDER BY sub.subject_name, sch.day
             ");
             echo json_encode($stmt->fetchAll());
             break;
 
-        // ========== READ: distinct subject codes for filter dropdown ==========
+        // ========== READ: subjects for filter dropdown (code + name) ==========
         case 'get_subject_list':
-            $stmt = $pdo->query("SELECT DISTINCT TRIM(course_code) AS subject_code FROM subjects WHERE course_code IS NOT NULL ORDER BY course_code");
-            $subjects = $stmt->fetchAll(PDO::FETCH_COLUMN);
-            $stmt2 = $pdo->query("SELECT DISTINCT TRIM(course_code) FROM classes WHERE course_code IS NOT NULL");
-            $classSubjects = $stmt2->fetchAll(PDO::FETCH_COLUMN);
-            $merged = array_unique(array_merge($subjects, $classSubjects));
-            sort($merged);
-            echo json_encode($merged);
+            // Returns objects { code, name } so the filter can DISPLAY the subject
+            // name while still FILTERING by course_code.
+            $stmt = $pdo->query("
+                SELECT DISTINCT TRIM(course_code) AS code, subject_name AS name
+                FROM subjects
+                WHERE course_code IS NOT NULL AND TRIM(course_code) <> ''
+                ORDER BY subject_name
+            ");
+            echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
+            break;
+
+        // ========== ADD student (admin only) ==========
+        case 'add_student':
+            // Collect + trim inputs
+            $student_number = trim($_POST['student_id'] ?? '');   // form field name is student_id
+            $full_name      = trim($_POST['full_name'] ?? '');
+            $gender         = trim($_POST['gender'] ?? '');
+            $course         = trim($_POST['course'] ?? '');
+            $year_level     = trim($_POST['year_level'] ?? '');
+            $contact        = trim($_POST['contact'] ?? '');
+            $email          = trim($_POST['email'] ?? '');
+            $parent_name    = trim($_POST['parent_name'] ?? '');
+            $parent_contact = trim($_POST['parent_contact'] ?? '');
+            $class_id       = intval($_POST['class_id'] ?? 0);
+            $schedule_id    = intval($_POST['schedule_id'] ?? 0);
+
+            // Validate required fields
+            if ($student_number === '' || $full_name === '' || $gender === '' || $course === ''
+                || $year_level === '' || $contact === '' || $email === ''
+                || $parent_name === '' || $parent_contact === '' || !$class_id || !$schedule_id) {
+                echo json_encode(['status'=>'error','message'=>'All fields are required, including a subject/class.']);
+                exit;
+            }
+            if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                echo json_encode(['status'=>'error','message'=>'Invalid email format']);
+                exit;
+            }
+
+            // Reject duplicate student number
+            $dup = $pdo->prepare("SELECT id FROM students WHERE student_number = ? LIMIT 1");
+            $dup->execute([$student_number]);
+            if ($dup->fetch()) {
+                echo json_encode(['status'=>'error','message'=>'A student with that Student ID already exists.']);
+                exit;
+            }
+
+            $pdo->beginTransaction();
+            try {
+                // 1. Student record
+                $pdo->prepare(
+                    "INSERT INTO students (student_number, full_name, gender, course, year_level, contact, email, created_at)
+                     VALUES (?,?,?,?,?,?,?, NOW())"
+                )->execute([$student_number, $full_name, $gender, $course, $year_level, $contact, $email]);
+                $new_student_id = $pdo->lastInsertId();
+
+                // 2. Parent / guardian record
+                $pdo->prepare(
+                    "INSERT INTO parents (student_id, parent_name, contact_number) VALUES (?,?,?)"
+                )->execute([$new_student_id, $parent_name, $parent_contact]);
+
+                // 3. Enrollment in the chosen class + schedule
+                $pdo->prepare(
+                    "INSERT INTO student_schedule (student_id, class_id, schedule_id) VALUES (?,?,?)"
+                )->execute([$new_student_id, $class_id, $schedule_id]);
+
+                $pdo->commit();
+                echo json_encode(['status'=>'success','message'=>'Student added successfully']);
+            } catch (Exception $e) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                echo json_encode(['status'=>'error','message'=>'Database error: '.$e->getMessage()]);
+            }
             break;
 
         // ========== READ one student ==========
@@ -115,7 +199,7 @@ try {
             echo json_encode($data ? array_merge(['status'=>'success'], $data) : ['status'=>'error','message'=>'Student not found']);
             break;
 
-        // ========== UPDATE student ==========
+        // ========== UPDATE student (admin only) ==========
         case 'update_profile':
             $id = $_POST['id'] ?? 0;
             if (!$id) { echo json_encode(['status'=>'error','message'=>'Student ID required']); exit; }
@@ -140,7 +224,7 @@ try {
             }
             break;
 
-        // ========== DELETE student ==========
+        // ========== DELETE student (admin only) ==========
         case 'delete_student':
             $id = $_POST['id'] ?? 0;
             if (!$id) { echo json_encode(['status'=>'error','message'=>'Student ID required']); exit; }
@@ -164,6 +248,7 @@ try {
             break;
 
         case 'add_teacher':
+            // Admin only – already enforced
             $requiredFields = ['name', 'subject', 'email', 'contact', 'age', 'address'];
             foreach ($requiredFields as $field) {
                 if (empty(trim($_POST[$field] ?? ''))) {
@@ -208,6 +293,7 @@ try {
             break;
 
         case 'update_teacher':
+            // Admin only – already enforced
             $id = $_POST['id'] ?? 0;
             if (!$id) { echo json_encode(['status'=>'error','message'=>'Teacher ID required']); exit; }
 
@@ -256,6 +342,7 @@ try {
             break;
 
         case 'delete_teacher':
+            // Admin only – already enforced
             $id = $_POST['id'] ?? 0;
             if (!$id) { echo json_encode(['status'=>'error','message'=>'ID required']); exit; }
             $pdo->prepare("DELETE FROM teachers WHERE id = ?")->execute([$id]);

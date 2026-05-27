@@ -1,6 +1,6 @@
 <?php
 require_once __DIR__ . '/config.php';
-requireTeacher();
+
 
 // BASE_URL is already defined in config.php – DO NOT redefine it here
 

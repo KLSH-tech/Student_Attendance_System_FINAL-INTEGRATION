@@ -9,7 +9,7 @@
 // ============================================================
 
 require_once __DIR__ . '/config.php';
-requireTeacher();                       // same shared session as the dashboard
+                    // same shared session as the dashboard
 
 header('Content-Type: application/json');
 

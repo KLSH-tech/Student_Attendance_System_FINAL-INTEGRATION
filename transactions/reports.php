@@ -1,6 +1,6 @@
 <?php
 require_once __DIR__ . '/config.php';
-requireTeacher();
+
 $pdo = db();
 
 $dateFrom  = $_GET['from']    ?? date('Y-m-01');

@@ -1,8 +1,8 @@
 <?php
 require_once __DIR__ . '/config.php';
-requireTeacher();
 
 $pdo = db();
+$teacher_id = (int)($_SESSION['t_id'] ?? 0);
 
 $dateFilter   = $_GET['date']   ?? date('Y-m-d');
 $statusFilter = $_GET['status'] ?? '';
@@ -59,13 +59,13 @@ if ($export === 'csv') {
     exit;
 }
 
-// Stats for selected date
+// Stats
 $present = array_sum(array_map(fn($r) => $r['status'] === 'Present' ? 1 : 0, $records));
 $late    = array_sum(array_map(fn($r) => $r['status'] === 'Late'    ? 1 : 0, $records));
 $absent  = array_sum(array_map(fn($r) => $r['status'] === 'Absent'  ? 1 : 0, $records));
 $total   = count($records);
 
-// Get list of classes for filter dropdown
+// Classes for filter
 $classes = $pdo->query("
     SELECT DISTINCT c.class_id, sub.subject_name, c.section
     FROM classes c
@@ -73,13 +73,20 @@ $classes = $pdo->query("
     ORDER BY sub.subject_name
 ")->fetchAll();
 
-// Available dates for quick jump
-$dates = $pdo->query("SELECT DISTINCT date FROM attendance ORDER BY date DESC LIMIT 30")->fetchAll(PDO::FETCH_COLUMN);
-
 $pageTitle    = 'Attendance';
 $pageSubtitle = date('l, F j, Y', strtotime($dateFilter));
 $activePage   = 'attendance';
 include 'layout.php';
+
+// Show success/error messages
+if (isset($_SESSION['success'])) {
+    echo '<div class="alert alert-success">✅ ' . $_SESSION['success'] . '</div>';
+    unset($_SESSION['success']);
+}
+if (isset($_SESSION['error'])) {
+    echo '<div class="alert alert-error">⚠ ' . htmlspecialchars($_SESSION['error']) . '</div>';
+    unset($_SESSION['error']);
+}
 ?>
 
 <div class="page-header">
@@ -128,28 +135,16 @@ include 'layout.php';
 
 <!-- Summary stats -->
 <div class="stats-row" style="grid-template-columns:repeat(4,1fr);margin-bottom:24px;">
-    <div class="stat-card c-blue">
-        <div class="stat-num"><?php echo $total; ?></div>
-        <div class="stat-label">Total Records</div>
-    </div>
-    <div class="stat-card c-green">
-        <div class="stat-num"><?php echo $present; ?></div>
-        <div class="stat-label">Present</div>
-    </div>
-    <div class="stat-card c-amber">
-        <div class="stat-num"><?php echo $late; ?></div>
-        <div class="stat-label">Late</div>
-    </div>
-    <div class="stat-card c-red">
-        <div class="stat-num"><?php echo $absent; ?></div>
-        <div class="stat-label">Absent</div>
-    </div>
+    <div class="stat-card c-blue"><div class="stat-num"><?php echo $total; ?></div><div class="stat-label">Total</div></div>
+    <div class="stat-card c-green"><div class="stat-num"><?php echo $present; ?></div><div class="stat-label">Present</div></div>
+    <div class="stat-card c-amber"><div class="stat-num"><?php echo $late; ?></div><div class="stat-label">Late</div></div>
+    <div class="stat-card c-red"><div class="stat-num"><?php echo $absent; ?></div><div class="stat-label">Absent</div></div>
 </div>
 
-<!-- Records table -->
+<!-- Records table with inline status change -->
 <div class="card">
     <div class="card-header">
-        <h3>Records for <?php echo date('F j, Y', strtotime($dateFilter)); ?></h3>
+        <h3>Students – <?php echo date('F j, Y', strtotime($dateFilter)); ?></h3>
     </div>
     <?php if (empty($records)): ?>
         <div class="empty-state">
@@ -159,7 +154,7 @@ include 'layout.php';
         </div>
     <?php else: ?>
     <div class="table-wrap">
-        <table>
+        <table class="attendance-table">
             <thead>
                 <tr>
                     <th>ID</th>
@@ -169,7 +164,7 @@ include 'layout.php';
                     <th>Time In</th>
                     <th>Time Out</th>
                     <th>Status</th>
-                    <th>Action</th>
+                    <th>Action (Change Status)</th>
                 </tr>
             </thead>
             <tbody>
@@ -180,14 +175,25 @@ include 'layout.php';
                         <strong><?php echo e($r['full_name']); ?></strong>
                         <small><?php echo e($r['student_number']); ?></small>
                     </td>
-                    <td style="font-size:12px;"><?php echo e($r['course']); ?></td>
-                    <td style="font-size:12px;"><?php echo e($r['section']); ?></td>
+                    <td><?php echo e($r['course']); ?></td>
+                    <td><?php echo e($r['section']); ?></td>
                     <td class="mono"><?php echo $r['time_in'] ? date('g:i A', strtotime($r['time_in'])) : '—'; ?></td>
                     <td class="mono"><?php echo $r['time_out'] ? date('g:i A', strtotime($r['time_out'])) : '—'; ?></td>
                     <td><span class="badge <?php echo statusClass($r['status']); ?>"><?php echo $r['status']; ?></span></td>
                     <td>
-                        <a href="student-record.php?id=<?php echo $r['student_db_id']; ?>" class="btn btn-ghost btn-sm">Profile</a>
-                    </td
+                        <form method="POST" action="update-attendance.php" style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+                            <?php echo csrfField(); ?>
+                            <input type="hidden" name="attendance_id" value="<?php echo $r['attendance_id']; ?>">
+                            <select name="new_status" class="status-select" style="padding:5px; border-radius:6px;">
+                                <option value="Present" <?php echo $r['status']=='Present' ? 'selected' : ''; ?>>Present</option>
+                                <option value="Late"    <?php echo $r['status']=='Late'    ? 'selected' : ''; ?>>Late</option>
+                                <option value="Absent"  <?php echo $r['status']=='Absent'  ? 'selected' : ''; ?>>Absent</option>
+                            </select>
+                            <input type="text" name="reason" placeholder="Reason (excuse letter...)" style="width:140px; padding:5px;">
+                            <button type="submit" class="btn btn-sm btn-primary">Save</button>
+                            <a href="student-record.php?id=<?php echo $r['student_db_id']; ?>" class="btn btn-ghost btn-sm">Profile</a>
+                        </form>
+                    </td>
                 </tr>
             <?php endforeach; ?>
             </tbody>

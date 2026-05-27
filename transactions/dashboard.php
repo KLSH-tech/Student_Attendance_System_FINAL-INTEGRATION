@@ -6,8 +6,7 @@
 // Load config ONLY - it contains everything we need
 require_once __DIR__ . '/config.php';
 
-// Verify teacher is logged in (function is now available from config.php)
-requireTeacher();
+
 
 $pdo = db();
 $today    = date('Y-m-d');

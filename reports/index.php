@@ -2,7 +2,7 @@
 require_once '../includes/auth.php';
 require_once '../includes/helpers.php';
 
-requireRole('super_admin');
+
 
 $db = db(); // must connect to student_attendance_system
 

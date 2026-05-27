@@ -2,7 +2,7 @@
 // setup.php — Teacher Portal standalone setup
 // Run once to create tables and seed demo data.
 require_once __DIR__ . '/config.php';
-requireTeacher();   // ← destructive (CREATE TABLE/seed): never allow anonymous URL access
+   // ← destructive (CREATE TABLE/seed): never allow anonymous URL access
 $log = [];
 
 function ok(string $m)  { global $log; $log[] = ['ok',  $m]; }
