@@ -106,17 +106,21 @@ function teacherLogin(string $username, string $password): bool {
                 // Silently fail
             }
 
-            $_SESSION['teacher_auth']   = true;
-            $_SESSION['t_id']           = $user['teacher_db_id'] ?? $user['user_id'];
-            $_SESSION['t_user_id']      = $user['user_id'];
-            $_SESSION['t_name']         = $user['teacher_name'] ?? $user['full_name'];
-            $_SESSION['t_number']       = $user['teacher_number'] ?? '';
-            $_SESSION['t_dept']         = $user['department'] ?? '';
-            $_SESSION['t_role']         = $user['role'];
-            $_SESSION['t_username']     = $user['username'];
-            $_SESSION['t_email']        = $user['email'] ?? '';
-            $_SESSION['t_login_time']   = time();
-            
+            // Write the canonical portal session keys via the SHARED helper, so
+            // this password login and the scanner's badge login stay identical.
+            require_once __DIR__ . '/../includes/teacher_portal_session.php';
+            setTeacherPortalSession([
+                'teacher_db_id'  => $user['teacher_db_id'] ?? null,
+                'user_id'        => $user['user_id'],
+                'teacher_name'   => $user['teacher_name'] ?? '',
+                'full_name'      => $user['full_name'] ?? '',
+                'teacher_number' => $user['teacher_number'] ?? '',
+                'department'     => $user['department'] ?? '',
+                'role'           => $user['role'],
+                'username'       => $user['username'],
+                'email'          => $user['email'] ?? '',
+            ]);
+
             return true;
         }
         return false;

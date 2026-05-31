@@ -8,6 +8,7 @@ require_once __DIR__ . '/../includes/auth.php';
 require_once __DIR__ . '/attendance_sync.php';
 require_once __DIR__ . '/../includes/mailer.php';   // PHPMailer-based parent e-mail notifications
 require_once __DIR__ . '/../includes/absent_processor.php'; // automatic absence marking (additive feature)
+require_once __DIR__ . '/../includes/teacher_portal_session.php'; // shared teacher-portal session writer (badge login)
 
 // Enable error logging
 error_reporting(E_ALL);
@@ -159,10 +160,27 @@ function getStudentProfile(string $scannedId, mysqli $conn): ?array {
 function getTeacherByNumber(string $scannedId, mysqli $conn): ?array {
     error_log("Searching for teacher with teacher_number: '" . $scannedId . "'");
 
+    // JOIN users because for user-linked teacher rows teachers.name is NULL and
+    // the real display name + role live on the users row. COALESCE so a teacher
+    // who only has teachers.name (no user_id) still resolves a name. We also pull
+    // role/username/email so the scan can build a portal session identical to the
+    // one teacherLogin() creates.
     $stmt = $conn->prepare("
-        SELECT id, user_id, name, subject, email, teacher_number, department, contact
-        FROM teachers
-        WHERE teacher_number = ?
+        SELECT
+            t.id            AS teacher_db_id,
+            t.user_id,
+            COALESCE(NULLIF(t.name, ''), u.full_name) AS display_name,
+            t.subject,
+            COALESCE(NULLIF(t.email, ''), u.email)    AS email,
+            t.teacher_number,
+            t.department,
+            t.contact,
+            u.username,
+            u.role,
+            u.status
+        FROM teachers t
+        LEFT JOIN users u ON u.id = t.user_id
+        WHERE t.teacher_number = ?
         LIMIT 1
     ");
     $stmt->bind_param('s', $scannedId);
@@ -171,7 +189,7 @@ function getTeacherByNumber(string $scannedId, mysqli $conn): ?array {
     $stmt->close();
 
     if ($result) {
-        error_log("Teacher found: " . ($result['name'] ?? '') . " (ID: " . $result['id'] . ")");
+        error_log("Teacher found: " . ($result['display_name'] ?? '') . " (teacher id: " . $result['teacher_db_id'] . ")");
         return $result;
     }
 
@@ -302,19 +320,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
     $student = getStudentProfile($scannedId, $conn);
     
     if (!$student) {
-        // Not a student — maybe it's a TEACHER badge. If so, send them to the
-        // teacher portal instead of reporting an unrecognized ID.
+        // Not a student — maybe it's a TEACHER badge. If so, LOG THE TEACHER IN
+        // (the scanner shares the SAMS_SESSION with the portal) and send them
+        // straight to THEIR dashboard, instead of reporting an unrecognized ID.
         $teacher = getTeacherByNumber($scannedId, $conn);
         $conn->close();
 
         if ($teacher) {
-            $portalUrl = (defined('BASE_URL') ? rtrim(BASE_URL, '/') : '') . '/transactions/index.php';
+            // Only active accounts may sign in by badge. teachers rows without a
+            // linked user have status NULL → treat as allowed (legacy local
+            // teacher), but a linked-but-inactive user is rejected.
+            $status = $teacher['status'] ?? null;
+            if ($status !== null && $status !== 'active') {
+                echo json_encode([
+                    'success' => false,
+                    'message' => 'This teacher account is inactive. Please contact the administrator.',
+                    'not_found' => true
+                ]);
+                exit;
+            }
+
+            // Establish the portal session exactly like teacherLogin() does, so
+            // every portal page sees a fully authenticated teacher.
+            session_regenerate_id(true);   // fresh session id on (badge) login
+            setTeacherPortalSession([
+                'teacher_db_id'  => (int) $teacher['teacher_db_id'],
+                'user_id'        => $teacher['user_id'] !== null ? (int) $teacher['user_id'] : null,
+                'teacher_name'   => $teacher['display_name'] ?? '',
+                'full_name'      => $teacher['display_name'] ?? '',
+                'teacher_number' => $teacher['teacher_number'] ?? '',
+                'department'     => $teacher['department'] ?? '',
+                'role'           => $teacher['role'] ?? 'teacher',
+                'username'       => $teacher['username'] ?? '',
+                'email'          => $teacher['email'] ?? '',
+            ]);
+
+            $teacherName = $teacher['display_name'] ?: 'Teacher';
+            error_log("🎓 TEACHER BADGE LOGIN: {$teacherName} (#{$teacher['teacher_db_id']}) → portal dashboard");
+
+            $portalUrl = (defined('BASE_URL') ? rtrim(BASE_URL, '/') : '') . '/transactions/dashboard.php';
             echo json_encode([
                 'success'      => false,
                 'is_teacher'   => true,
                 'redirect'     => $portalUrl,
-                'teacher_name' => $teacher['name'] ?? 'Teacher',
-                'message'      => 'Teacher recognized. Redirecting to the teacher portal…'
+                'teacher_name' => $teacherName,
+                'message'      => "Welcome, {$teacherName}! Opening your portal…"
             ]);
             exit;
         }
@@ -1102,11 +1152,13 @@ function showNotFound(id) {
 function showTeacher(data) {
     resetNotif();
     const now = new Date();
-    const name = data.teacher_name ? ' — ' + data.teacher_name : '';
-    setCommon('🎓', '● TEACHER', data.message || 'Redirecting to the teacher portal…', 'Teacher' + name, now.toLocaleTimeString('en-PH', { hour12: true }), now.toLocaleDateString('en-PH', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }));
+    const name = data.teacher_name || 'Teacher';
+    setCommon('🎓', '● TEACHER LOGIN', data.message || 'Opening your portal…', 'Signed in as ' + name, now.toLocaleTimeString('en-PH', { hour12: true }), now.toLocaleDateString('en-PH', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }));
     revealNotif('time-in');
+    // Badge login already established the portal session server-side; go to the
+    // teacher's own dashboard. Brief pause so the confirmation is visible.
     if (data.redirect) {
-        setTimeout(() => { window.location.href = data.redirect; }, 1200);
+        setTimeout(() => { window.location.href = data.redirect; }, 1000);
     }
 }
 
