@@ -151,6 +151,35 @@ function getStudentProfile(string $scannedId, mysqli $conn): ?array {
 }
 
 /**
+ * Look up a TEACHER by the scanned barcode (teachers.teacher_number).
+ * Returns the teacher row, or null when the scanned code is not a teacher.
+ * Kept separate from the student lookup so a teacher badge scan can redirect
+ * to the teacher portal instead of being reported as "unrecognized ID".
+ */
+function getTeacherByNumber(string $scannedId, mysqli $conn): ?array {
+    error_log("Searching for teacher with teacher_number: '" . $scannedId . "'");
+
+    $stmt = $conn->prepare("
+        SELECT id, user_id, name, subject, email, teacher_number, department, contact
+        FROM teachers
+        WHERE teacher_number = ?
+        LIMIT 1
+    ");
+    $stmt->bind_param('s', $scannedId);
+    $stmt->execute();
+    $result = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    if ($result) {
+        error_log("Teacher found: " . ($result['name'] ?? '') . " (ID: " . $result['id'] . ")");
+        return $result;
+    }
+
+    error_log("Teacher NOT found with teacher_number: " . $scannedId);
+    return null;
+}
+
+/**
  * Get ALL student's schedules
  */
 function getAllStudentSchedules(int $studentId, mysqli $conn): array {
@@ -273,10 +302,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
     $student = getStudentProfile($scannedId, $conn);
     
     if (!$student) {
+        // Not a student — maybe it's a TEACHER badge. If so, send them to the
+        // teacher portal instead of reporting an unrecognized ID.
+        $teacher = getTeacherByNumber($scannedId, $conn);
         $conn->close();
+
+        if ($teacher) {
+            $portalUrl = (defined('BASE_URL') ? rtrim(BASE_URL, '/') : '') . '/transactions/index.php';
+            echo json_encode([
+                'success'      => false,
+                'is_teacher'   => true,
+                'redirect'     => $portalUrl,
+                'teacher_name' => $teacher['name'] ?? 'Teacher',
+                'message'      => 'Teacher recognized. Redirecting to the teacher portal…'
+            ]);
+            exit;
+        }
+
         echo json_encode([
-            'success' => false, 
-            'message' => 'Student not found. Please check your ID number.', 
+            'success' => false,
+            'message' => 'Student not found. Please check your ID number.',
             'not_found' => true
         ]);
         exit;
@@ -949,6 +994,9 @@ function submitScan(id) {
                     email_recipient: emailRecipient
                 });
             }
+            else if (data.is_teacher) {
+                showTeacher(data);
+            }
             else if (data.not_found) {
                 showNotFound(id);
             }
@@ -1049,6 +1097,17 @@ function showNotFound(id) {
     const now = new Date();
     setCommon('⚠️', '● NOT FOUND', 'Unrecognized ID', 'ID: ' + id + ' — not registered', now.toLocaleTimeString('en-PH', { hour12: true }), now.toLocaleDateString('en-PH', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }));
     revealNotif('not-found');
+}
+
+function showTeacher(data) {
+    resetNotif();
+    const now = new Date();
+    const name = data.teacher_name ? ' — ' + data.teacher_name : '';
+    setCommon('🎓', '● TEACHER', data.message || 'Redirecting to the teacher portal…', 'Teacher' + name, now.toLocaleTimeString('en-PH', { hour12: true }), now.toLocaleDateString('en-PH', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }));
+    revealNotif('time-in');
+    if (data.redirect) {
+        setTimeout(() => { window.location.href = data.redirect; }, 1200);
+    }
 }
 
 function showDuplicate(data, id) {
