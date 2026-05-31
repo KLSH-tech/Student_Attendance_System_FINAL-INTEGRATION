@@ -6,6 +6,8 @@
 // Load config ONLY - it contains everything we need
 require_once __DIR__ . '/config.php';
 
+requireTeacher();   // guard: only signed-in teachers/admins past this point
+
 
 
 $pdo = db();

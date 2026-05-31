@@ -59,7 +59,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <label for="password">Password</label>
     <input id="password" name="password" type="password" required>
     <button type="submit">Sign In</button>
-    <a class="back-link" href="<?php echo e(BASE_URL); ?>/transactions/dashboard.php">&larr; Back to Scanner</a>
+    <a class="back-link" href="<?php echo e(BASE_URL); ?>/scanner/attendance_scanner.php">&larr; Back to Scanner</a>
   </form>
 </body>
 </html>

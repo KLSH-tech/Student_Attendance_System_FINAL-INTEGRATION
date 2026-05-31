@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/config.php';
+requireTeacher();   // guard: only signed-in teachers/admins past this point
 
 $pdo = db();
 $teacher_id = (int)($_SESSION['t_id'] ?? 0);

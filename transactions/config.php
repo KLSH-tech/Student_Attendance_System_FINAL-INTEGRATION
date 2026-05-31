@@ -67,6 +67,65 @@ function requireTeacher(): void {
         header('Location: ../auth/login.php');
         exit;
     }
+    // A teacher reached us through the UNIFIED login (/auth/login.php sets only
+    // uid/uname/urole) — backfill the portal's t_* session keys so the header
+    // greets them by name and t_id-based queries work. Badge/native logins
+    // already set teacher_auth, so this only fills the gap for unified sessions.
+    hydrateTeacherSessionFromUnified();
+}
+
+/**
+ * If the current session was created by the unified /auth/login.php (which sets
+ * uid/uname/urole but none of the portal's t_* keys), populate those keys from
+ * the DB. Idempotent: does nothing once t_name is set. This is why a manual
+ * login now shows the real name instead of the generic "Teacher".
+ */
+function hydrateTeacherSessionFromUnified(): void {
+    if (!empty($_SESSION['t_name'])) {
+        return;   // already a full portal session (badge/native login)
+    }
+    if (empty($_SESSION['uid'])) {
+        return;   // not a unified session either — nothing to hydrate
+    }
+
+    require_once __DIR__ . '/../includes/teacher_portal_session.php';
+
+    $uid = (int) $_SESSION['uid'];
+    try {
+        $stmt = db()->prepare("
+            SELECT u.id AS user_id, u.username, u.full_name, u.email, u.role,
+                   t.id AS teacher_db_id, t.name AS teacher_name,
+                   t.teacher_number, t.department
+            FROM users u
+            LEFT JOIN teachers t ON t.user_id = u.id
+            WHERE u.id = ?
+            LIMIT 1
+        ");
+        $stmt->execute([$uid]);
+        $u = $stmt->fetch();
+    } catch (PDOException $e) {
+        error_log('[TeacherPortal] hydrate failed: ' . $e->getMessage());
+        $u = false;
+    }
+
+    if ($u) {
+        setTeacherPortalSession([
+            'teacher_db_id'  => $u['teacher_db_id'] ?? null,
+            'user_id'        => $u['user_id'],
+            'teacher_name'   => $u['teacher_name'] ?? '',
+            'full_name'      => $u['full_name'] ?? '',
+            'teacher_number' => $u['teacher_number'] ?? '',
+            'department'     => $u['department'] ?? '',
+            'role'           => $u['role'] ?? 'teacher',
+            'username'       => $u['username'] ?? '',
+            'email'          => $u['email'] ?? '',
+        ]);
+    } else {
+        // Couldn't resolve a teachers row — at least show the unified name so the
+        // header never falls back to a bare "Teacher".
+        $_SESSION['t_name'] = $_SESSION['uname'] ?? 'Teacher';
+        $_SESSION['t_id']   = $_SESSION['t_id'] ?? $uid;
+    }
 }
 
 // ── Teacher login function ────────────────────────────────────────────────────
