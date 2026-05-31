@@ -15,6 +15,12 @@ error_reporting(E_ALL);
 ini_set('display_errors', 0);
 ini_set('log_errors', 1);
 
+// Never let a browser (or its back/forward cache) serve a STALE copy of this
+// page. Without this, returning to a previously-opened scanner tab could show a
+// former teacher's name even after the session switched to a new teacher.
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+
 // ========== SMS CONFIGURATION ==========
 // I-set sa TRUE kung ayaw munang magpadala ng totoong SMS (testing lang)
 // I-set sa FALSE kapag handa na para sa totoong SMS sa mga magulang
@@ -340,8 +346,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
                 exit;
             }
 
-            // Establish the portal session exactly like teacherLogin() does, so
-            // every portal page sees a fully authenticated teacher.
+            // Switching teachers: WIPE any previous teacher/unified identity
+            // first so no stale key (t_*, uid/uname/urole) survives into the new
+            // teacher's session. Without this, scanning teacher B while teacher A
+            // is active could leave A's leftover keys behind. Then regenerate the
+            // id and set the new teacher cleanly.
+            $_SESSION = [];
             session_regenerate_id(true);   // fresh session id on (badge) login
             setTeacherPortalSession([
                 'teacher_db_id'  => (int) $teacher['teacher_db_id'],
@@ -911,6 +921,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
 <body>
 
 <?php require_once __DIR__ . '/../includes/nav.php'; renderNav('scanner'); ?>
+
+<?php
+// ── ACTIVE TEACHER BANNER ────────────────────────────────────────────────────
+// Rendered SERVER-SIDE on every page load, straight from the live session — so
+// it always reflects the teacher whose badge was scanned LAST (or none after a
+// logout). This is what fixes the "stale previous teacher name" bug: the name is
+// never cached in JS, it is re-read from $_SESSION each request.
+$activeTeacherName = (!empty($_SESSION['teacher_auth']) && !empty($_SESSION['t_name']))
+    ? $_SESSION['t_name']
+    : '';
+if ($activeTeacherName !== ''):
+?>
+<div id="active-teacher-bar" style="position:relative;z-index:1;width:100%;max-width:900px;margin:18px auto 0;
+     padding:10px 18px;border:1px solid #14304f;border-radius:10px;background:rgba(0,200,255,.06);
+     display:flex;align-items:center;justify-content:space-between;gap:14px;font-family:'Exo 2',sans-serif;">
+  <span style="color:#bcd6ec;font-size:.85rem;letter-spacing:.04em;">
+    👤 Active teacher session: <strong style="color:#00ff9d;"><?php echo htmlspecialchars($activeTeacherName, ENT_QUOTES, 'UTF-8'); ?></strong>
+  </span>
+  <a href="<?php echo htmlspecialchars(rtrim(BASE_URL, '/') . '/transactions/dashboard.php', ENT_QUOTES, 'UTF-8'); ?>"
+     style="color:#00c8ff;font-size:.8rem;text-decoration:none;font-weight:600;white-space:nowrap;">Open Portal →</a>
+</div>
+<?php endif; ?>
 
 <header>
     <div class="logo">SCAN<span>TRACK</span></div>

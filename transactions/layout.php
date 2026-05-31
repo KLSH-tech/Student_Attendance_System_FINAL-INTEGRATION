@@ -422,9 +422,12 @@ $activePage = $activePage ?? 'dashboard';
     </header>
 
     <nav class="nav-bar">
-        <a href="../scanner/attendance_scanner.php" class="nav-link" target="_blank">
+        <!-- Open the scanner in the SAME tab (no target=_blank): a new tab would
+             keep showing a stale teacher name while the session moves on. Same-tab
+             navigation forces a fresh server render that reflects the live session. -->
+        <a href="../scanner/attendance_scanner.php" class="nav-link">
     <span>🏷️</span> Barcode Scanner
-        S</a>
+        </a>
         <a href="dashboard.php" class="nav-link <?php echo $activePage === 'dashboard' ? 'active' : ''; ?>">
             <span>📊</span> Dashboard
         </a>
