@@ -7,6 +7,7 @@
 require_once __DIR__ . '/../includes/auth.php';
 require_once __DIR__ . '/attendance_sync.php';
 require_once __DIR__ . '/../includes/mailer.php';   // PHPMailer-based parent e-mail notifications
+require_once __DIR__ . '/../includes/absent_processor.php'; // automatic absence marking (additive feature)
 
 // Enable error logging
 error_reporting(E_ALL);
@@ -17,6 +18,18 @@ ini_set('log_errors', 1);
 // I-set sa TRUE kung ayaw munang magpadala ng totoong SMS (testing lang)
 // I-set sa FALSE kapag handa na para sa totoong SMS sa mga magulang
 define('SMS_TEST_MODE', false);  // <-- PALITAN sa false kapag handa na
+
+// ── AUTOMATIC ABSENCE MARKING (additive) ─────────────────────────────────────
+// Fill in any due absences (grace period elapsed) WITHOUT requiring cron on a
+// XAMPP/demo box. Registered as a SHUTDOWN task so it runs only AFTER the scan
+// response has been sent — it can never delay, alter or break a scan, the
+// IN/OUT toggle, late detection, SMS or e-mail. It is also internally throttled
+// (runs at most once every ~2 minutes) and fully wrapped in try/catch.
+register_shutdown_function(function () {
+    if (function_exists('maybeRunAbsenceSweep')) {
+        maybeRunAbsenceSweep(120);
+    }
+});
 
 function getDB() {
     $conn = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
@@ -603,7 +616,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-    <title>Student Attendance Scanner | </title>
+    <title>Student Attendance Scanner | SCANTRACK</title>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Exo+2:wght@300;400;600&display=swap" rel="stylesheet"/>
     <style>
         :root {
@@ -704,7 +717,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
 <?php require_once __DIR__ . '/../includes/nav.php'; renderNav('scanner'); ?>
 
 <header>
-    <div class="logo"></div>
+    <div class="logo">SCAN<span>TRACK</span></div>
     <div>
         <div id="live-clock">00:00:00</div>
         <div id="live-date">—</div>

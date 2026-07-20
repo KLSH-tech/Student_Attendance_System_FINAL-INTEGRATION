@@ -214,7 +214,7 @@ $pdo = db();
     </div>
 </div>
 
-<!-- Add/Edit Teacher Form Modal -->
+<!-- Add/Edit Teacher Form Modal (No profile picture field) -->
 <div class="modal fade" id="teacherFormModal" tabindex="-1">
     <div class="modal-dialog modal-lg modal-dialog-centered">
         <div class="modal-content border-0 shadow">
@@ -223,7 +223,7 @@ $pdo = db();
                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body p-4">
-                <form id="teacherForm" enctype="multipart/form-data">
+                <form id="teacherForm">
                     <input type="hidden" name="id" id="editTeacherId">
                     <div class="row g-3">
                         <div class="col-md-6"><label class="form-label">Full Name *</label><input type="text" name="name" id="teacherName" class="form-control" required></div>
@@ -232,16 +232,6 @@ $pdo = db();
                         <div class="col-md-6"><label class="form-label">Email *</label><input type="email" name="email" id="teacherEmail" class="form-control" required></div>
                         <div class="col-md-6"><label class="form-label">Contact Number *</label><input type="text" name="contact" id="teacherContact" class="form-control" required></div>
                         <div class="col-md-6"><label class="form-label">Age *</label><input type="number" name="age" id="teacherAge" class="form-control" required></div>
-                        <div class="col-md-6">
-                            <label class="form-label">Profile Picture</label>
-                            <input type="file" name="profile_picture_file" id="teacherProfilePicFile" class="form-control" accept="image/jpeg,image/png,image/webp">
-                            <small class="text-muted">Allowed: JPG, PNG, WEBP (max 2MB)</small>
-                            <div id="imagePreview" class="mt-2" style="display:none;">
-                                <img id="previewImg" src="" style="max-width: 100px; border-radius: 50%;">
-                                <button type="button" class="btn btn-sm btn-outline-danger mt-1" onclick="clearImagePreview()">Remove</button>
-                            </div>
-                            <input type="hidden" name="existing_profile_picture" id="teacherProfilePicHidden" value="">
-                        </div>
                         <div class="col-12"><label class="form-label">Address *</label><textarea name="address" id="teacherAddress" rows="2" class="form-control" required></textarea></div>
                         <div class="col-12"><label class="form-label">Bio</label><textarea name="bio" id="teacherBio" rows="3" class="form-control"></textarea></div>
                     </div>
@@ -534,7 +524,7 @@ $pdo = db();
                 teachers.forEach(t => {
                     html += `<a href="#" class="list-group-item list-group-item-action" onclick="showTeacherProfile(${t.id}); return false;">
                                 <div class="d-flex align-items-center">
-                                    <img src="${t.profile_picture || 'https://ui-avatars.com/api/?name='+encodeURIComponent(t.name)+'&background=2a5298&color=fff&rounded=true'}" style="width: 40px; height: 40px; border-radius: 50%; object-fit: cover; margin-right: 10px;">
+                                    <img src="https://ui-avatars.com/api/?name=${encodeURIComponent(t.name)}&background=2a5298&color=fff&rounded=true" style="width: 40px; height: 40px; border-radius: 50%; object-fit: cover; margin-right: 10px;">
                                     <div><strong>${escapeHtml(t.name)}</strong><br><small>${escapeHtml(t.subject)}</small></div>
                                 </div>
                             </a>`;
@@ -551,8 +541,7 @@ $pdo = db();
             .then(data => {
                 if (data.status === 'error') { showNotification(data.message, 'error'); return; }
                 const t = data.data;
-                const defaultPic = 'https://ui-avatars.com/api/?name='+encodeURIComponent(t.name)+'&background=2a5298&color=fff&rounded=true';
-                const pic = t.profile_picture && t.profile_picture.trim() ? t.profile_picture : defaultPic;
+                const pic = 'https://ui-avatars.com/api/?name='+encodeURIComponent(t.name)+'&background=2a5298&color=fff&rounded=true';
                 const detailHtml = `
                     <div class="text-center">
                         <img src="${pic}" class="rounded-circle mb-3" style="width: 120px; height: 120px; object-fit: cover; border: 3px solid #2a5298;">
@@ -580,8 +569,6 @@ $pdo = db();
         document.getElementById('teacherFormTitle').innerText = 'Add New Teacher';
         document.getElementById('teacherForm').reset();
         document.getElementById('editTeacherId').value = '';
-        document.getElementById('imagePreview').style.display = 'none';
-        document.getElementById('teacherProfilePicHidden').value = '';
         new bootstrap.Modal(document.getElementById('teacherFormModal')).show();
     }
 
@@ -601,39 +588,9 @@ $pdo = db();
                     document.getElementById('teacherAge').value = t.age || '';
                     document.getElementById('teacherAddress').value = t.address || '';
                     document.getElementById('teacherBio').value = t.bio || '';
-
-                    const existingPic = t.profile_picture || '';
-                    document.getElementById('teacherProfilePicHidden').value = existingPic;
-                    if (existingPic) {
-                        document.getElementById('previewImg').src = existingPic;
-                        document.getElementById('imagePreview').style.display = 'block';
-                    } else {
-                        document.getElementById('imagePreview').style.display = 'none';
-                    }
                     new bootstrap.Modal(document.getElementById('teacherFormModal')).show();
                 } else showNotification(data.message, 'error');
             });
-    }
-
-    function previewImage(input) {
-        const previewDiv = document.getElementById('imagePreview');
-        const previewImg = document.getElementById('previewImg');
-        if (input.files && input.files[0]) {
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                previewImg.src = e.target.result;
-                previewDiv.style.display = 'block';
-            };
-            reader.readAsDataURL(input.files[0]);
-        } else {
-            previewDiv.style.display = 'none';
-        }
-    }
-
-    function clearImagePreview() {
-        document.getElementById('teacherProfilePicFile').value = '';
-        document.getElementById('imagePreview').style.display = 'none';
-        document.getElementById('teacherProfilePicHidden').value = '';
     }
 
     function saveTeacher() {
@@ -659,9 +616,6 @@ $pdo = db();
         loadSubjectFilter();
         attachDaySelectorEvents();
         setupClearSearchButton();
-        document.getElementById('teacherProfilePicFile').addEventListener('change', function() {
-            previewImage(this);
-        });
     });
 </script>
 </body>

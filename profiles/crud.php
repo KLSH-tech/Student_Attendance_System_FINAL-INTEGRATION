@@ -18,46 +18,6 @@ if (!isLoggedIn() || !in_array(currentUser()['role'], ['admin', 'super_admin'], 
 $pdo = db();
 $action = $_POST['action'] ?? $_GET['action'] ?? '';
 
-// ----------------------------------------------------------------------------
-// Helper: Handle teacher profile image upload
-// ----------------------------------------------------------------------------
-function handleTeacherImageUpload($existingPath = '') {
-    if (!isset($_FILES['profile_picture_file']) || $_FILES['profile_picture_file']['error'] === UPLOAD_ERR_NO_FILE) {
-        return $existingPath; // keep existing
-    }
-    $file = $_FILES['profile_picture_file'];
-    if ($file['error'] !== UPLOAD_ERR_OK) {
-        throw new Exception('File upload error: ' . $file['error']);
-    }
-    $allowed = ['image/jpeg', 'image/png', 'image/webp'];
-    $finfo = finfo_open(FILEINFO_MIME_TYPE);
-    $mime = finfo_file($finfo, $file['tmp_name']);
-    finfo_close($finfo);
-    if (!in_array($mime, $allowed)) {
-        throw new Exception('Only JPG, PNG, WEBP images are allowed');
-    }
-    if ($file['size'] > 2 * 1024 * 1024) { // 2MB
-        throw new Exception('File size must be less than 2MB');
-    }
-    // Upload to project root /uploads/teachers/ (one level above profiles)
-    $uploadDir = __DIR__ . '/../uploads/teachers/';
-    if (!is_dir($uploadDir)) {
-        mkdir($uploadDir, 0755, true);
-    }
-    $ext = pathinfo($file['name'], PATHINFO_EXTENSION);
-    $newFileName = 'teacher_' . time() . '_' . bin2hex(random_bytes(8)) . '.' . $ext;
-    $destination = $uploadDir . $newFileName;
-    if (!move_uploaded_file($file['tmp_name'], $destination)) {
-        throw new Exception('Failed to save uploaded file');
-    }
-    // Delete old file if exists and different
-    if (!empty($existingPath) && file_exists(__DIR__ . '/../' . $existingPath)) {
-        unlink(__DIR__ . '/../' . $existingPath);
-    }
-    // Store path relative to project root (no leading slash)
-    return 'uploads/teachers/' . $newFileName;
-}
-
 try {
     switch ($action) {
         // ========== STUDENT: get students grouped by subject ==========
@@ -190,7 +150,7 @@ try {
 
         // ========== TEACHER ACTIONS ==========
         case 'get_teachers':
-            $stmt = $pdo->query("SELECT id, name, subject, email, contact, profile_picture, bio, age, address, teacher_number FROM teachers ORDER BY name");
+            $stmt = $pdo->query("SELECT id, name, subject, email, contact, bio, age, address, teacher_number FROM teachers ORDER BY name");
             echo json_encode($stmt->fetchAll());
             break;
 
@@ -230,23 +190,15 @@ try {
                 exit;
             }
 
-            try {
-                $profilePicturePath = handleTeacherImageUpload('');
-            } catch (Exception $e) {
-                echo json_encode(['status'=>'error','message'=>$e->getMessage()]);
-                exit;
-            }
-
             $stmt = $pdo->prepare(
-                "INSERT INTO teachers (name, subject, email, contact, profile_picture, bio, age, address, teacher_number)
-                 VALUES (?,?,?,?,?,?,?,?,?)"
+                "INSERT INTO teachers (name, subject, email, contact, bio, age, address, teacher_number)
+                 VALUES (?,?,?,?,?,?,?,?)"
             );
             $stmt->execute([
                 $name,
                 trim($_POST['subject']),
                 $email,
                 trim($_POST['contact']),
-                $profilePicturePath,
                 trim($_POST['bio'] ?? ''),
                 trim($_POST['age']),
                 trim($_POST['address']),
@@ -285,19 +237,8 @@ try {
                 exit;
             }
 
-            $stmt = $pdo->prepare("SELECT profile_picture FROM teachers WHERE id = ?");
-            $stmt->execute([$id]);
-            $existingPicture = $stmt->fetchColumn();
-
-            try {
-                $newPicture = handleTeacherImageUpload($existingPicture ?: '');
-            } catch (Exception $e) {
-                echo json_encode(['status'=>'error','message'=>$e->getMessage()]);
-                exit;
-            }
-
             $stmt = $pdo->prepare(
-                "UPDATE teachers SET name=?, subject=?, email=?, contact=?, profile_picture=?, bio=?, age=?, address=?, teacher_number=?
+                "UPDATE teachers SET name=?, subject=?, email=?, contact=?, bio=?, age=?, address=?, teacher_number=?
                  WHERE id=?"
             );
             $stmt->execute([
@@ -305,7 +246,6 @@ try {
                 trim($_POST['subject']),
                 $email,
                 trim($_POST['contact']),
-                $newPicture,
                 trim($_POST['bio'] ?? ''),
                 trim($_POST['age']),
                 trim($_POST['address']),

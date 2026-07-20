@@ -13,7 +13,7 @@ if (!defined('DB_PASS')) define('DB_PASS', '');
 define('CLASS_START_TIME',       '08:00:00');
 define('PRESENT_WINDOW_MINUTES', 0);
 define('LATE_WINDOW_MINUTES',    15);
-define('BASE_URL', 'http://localhost/Integration_Final_EMAIL_UPGRADE/Integration__Final');
+define('BASE_URL', 'http://localhost/Integration_Final_EMAIL_UPGRADE');
 
 // ── Base URL ──────────────────────────────────────────────────────────────────
 if (!defined('BASE_URL')) {

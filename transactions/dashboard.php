@@ -35,9 +35,13 @@ $todayCounts = $pdo->query("
 
 $presentToday = (int) ($todayCounts['present'] ?? 0);
 $lateToday    = (int) ($todayCounts['late'] ?? 0);
-$absentToday  = 0;                                  // scans never record a plain "Absent"
+// Auto-absence marking now records real "Absent" rows in the summary table once
+// a class's grace period ends, so this reflects them instead of a hardcoded 0.
+$absentToday  = (int) $pdo->query(
+    "SELECT COUNT(*) FROM attendance WHERE status = 'Absent' AND `date` = CURDATE()"
+)->fetchColumn();
 $markedToday  = $presentToday + $lateToday;         // distinct students seen today
-$notMarked    = max(0, $totalStudents - $markedToday);
+$notMarked    = max(0, $totalStudents - $markedToday - $absentToday);
 $pendingDisputes = pendingDisputeCount();
 
 $totalRecords  = (int) $pdo->query("SELECT COUNT(*) FROM attendance")->fetchColumn();

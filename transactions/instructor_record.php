@@ -131,35 +131,16 @@ include 'layout.php';
     </div>
     <div class="card-body" style="padding: 20px;">
         <div style="display: flex; gap: 20px; flex-wrap: wrap;">
-           <?php
-$imageDir = __DIR__ . '/../profiles/uploads/teachers/';
-$imageUrl = BASE_URL . '/profiles/uploads/teachers/default.png';
-
-// get all teacher images
-$files = glob($imageDir . 'teacher_*');
-
-// if image exists use latest one
-if (!empty($files)) {
-
-    // newest uploaded file
-    usort($files, function($a, $b) {
-        return filemtime($b) - filemtime($a);
-    });
-
-    $latestFile = basename($files[0]);
-
-    $imageUrl = BASE_URL . '/profiles/uploads/teachers/' . $latestFile;
-}
-?>
-
-<img src="<?php echo htmlspecialchars($imageUrl); ?>"
-     style="width: 120px; height: 120px; object-fit: cover; border-radius: 50%; border: 3px solid #2a5298;">
+            <img src="https://ui-avatars.com/api/?name=<?php echo urlencode($teacher['name']); ?>&background=2a5298&color=fff&rounded=true"
+                 style="width: 120px; height: 120px; object-fit: cover; border-radius: 50%; border: 3px solid #2a5298;">
             <div class="info-grid" style="flex: 1;">
                 <div><strong>Full Name:</strong><br><?php echo htmlspecialchars($teacher['name']); ?></div>
                 <div><strong>Teacher Number:</strong><br><?php echo htmlspecialchars($teacher['teacher_number'] ?? 'N/A'); ?></div>
                 <div><strong>Department:</strong><br><?php echo htmlspecialchars($teacher['department'] ?? 'N/A'); ?></div>
                 <div><strong>Email:</strong><br><?php echo htmlspecialchars($teacher['email'] ?? $teacher['user_email'] ?? 'N/A'); ?></div>
                 <div><strong>Contact:</strong><br><?php echo htmlspecialchars($teacher['contact'] ?? 'N/A'); ?></div>
+                <div><strong>Age:</strong><br><?php echo htmlspecialchars($teacher['age'] ?? 'N/A'); ?></div>
+                <div><strong>Address:</strong><br><?php echo htmlspecialchars($teacher['address'] ?? 'N/A'); ?></div>
             </div>
         </div>
     </div>

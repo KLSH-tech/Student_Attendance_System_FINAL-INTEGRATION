@@ -1,10 +1,11 @@
-<?php require_once __DIR__ . '/../includes/guard.php'; ?>
 <?php
-// reports.php - G6 Detailed Reports
+require_once __DIR__ . '/../includes/guard.php';
+require_once __DIR__ . '/../includes/db.php';
 
-$db = new PDO('mysql:host=localhost;dbname=G6_reports_db;charset=utf8mb4', 'root', '');
-$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-$db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+// Use the main database connection
+$pdo = db();
+$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
 
 $type      = $_GET['type'] ?? 'daily';
 $today     = date('Y-m-d');
@@ -22,13 +23,15 @@ if (date('N', strtotime($date)) != 1) {
     $date = date('Y-m-d', strtotime('last monday', strtotime($date)));
 }
 
-// Fetch all available Mondays
-$availableMondays = $db->query("
+// Fetch all available Mondays from attendance table
+$availableMondays = $pdo->prepare("
     SELECT DISTINCT date
-    FROM attendance_data
+    FROM attendance
     WHERE DAYOFWEEK(date) = 2
     ORDER BY date DESC
-")->fetchAll(PDO::FETCH_COLUMN);
+");
+$availableMondays->execute();
+$availableMondays = $availableMondays->fetchAll(PDO::FETCH_COLUMN);
 
 function buildPageUrl($pageNumber) {
     $params = $_GET;
@@ -58,17 +61,17 @@ function renderPagination($page, $totalPages) {
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>G6 - Reports</title>
+    <title>Attendance Reports</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.28/jspdf.plugin.autotable.min.js"></script>
     <style>
         body           { background: #f8f9fc; }
         .section-title { border-bottom: 3px solid #4e73df; padding-bottom: 10px; margin-bottom: 20px; color: #4e73df; }
-        .badge-present { background: #1cc88a; }
-        .badge-absent  { background: #e74a3b; }
+        .badge-present { background: #1cc88a; color: white; }
+        .badge-absent  { background: #e74a3b; color: white; }
         .badge-late    { background: #f6c23e; color: #000; }
-        .badge-excused { background: #858796; }
+        .badge-excused { background: #858796; color: white; }
         .no-data       { color: #858796; font-style: italic; }
 
         @media print {
@@ -98,13 +101,51 @@ function renderPagination($page, $totalPages) {
         }
         .monday-only-note { font-size: 0.78rem; color: #858796; }
         .pagination .page-link { min-width: 90px; text-align: center; }
+        
+        /* Subject grouping styles */
+        .subject-group {
+            margin-bottom: 30px;
+            border: 1px solid #e3e6f0;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .subject-header {
+            background: #4e73df;
+            color: white;
+            padding: 12px 15px;
+            font-weight: 600;
+            font-size: 1.1rem;
+        }
+        .subject-header i { margin-right: 8px; }
+        .subject-schedule {
+            background: #f8f9fc;
+            padding: 8px 15px;
+            font-size: 0.85rem;
+            border-bottom: 1px solid #e3e6f0;
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+        .subject-schedule span { color: #5a5c69; }
+        .student-list { padding: 0 15px 15px 15px; }
+        .student-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        .student-row:last-child { border-bottom: none; }
+        .student-name { font-weight: 500; }
+        .student-id { color: #858796; font-size: 0.85rem; }
+        .student-status { font-size: 0.8rem; }
     </style>
 </head>
 <body class="p-4">
 <div class="container">
 
     <div class="print-header">
-        <h3>G6 - Reports & Analytics Subsystem</h3>
+        <h3>Attendance Reports & Analytics</h3>
         <p>Integrated Classroom Attendance Management System</p>
         <p>Generated: <?= date('F j, Y h:i A') ?></p>
         <hr>
@@ -141,15 +182,139 @@ function renderPagination($page, $totalPages) {
             <?php endforeach; ?>
         </div>
         <?php endif; ?>
+        
+        <!-- Report type selector -->
+        <div class="ms-auto">
+            <select class="form-select form-select-sm" onchange="window.location.href='?type='+this.value+'&date=<?= urlencode($date) ?>'">
+                <option value="daily" <?= $type == 'daily' ? 'selected' : '' ?>>Daily Attendance</option>
+                <option value="summary" <?= $type == 'summary' ? 'selected' : '' ?>>Student Summary</option>
+                <option value="by_subject" <?= $type == 'by_subject' ? 'selected' : '' ?>>Students by Subject</option>
+                <option value="statistics" <?= $type == 'statistics' ? 'selected' : '' ?>>Statistics by Course</option>
+                <option value="status_breakdown" <?= $type == 'status_breakdown' ? 'selected' : '' ?>>Status Breakdown</option>
+            </select>
+        </div>
     </div>
 
     <?php
 
-    if ($type === 'daily'):
-        $countStmt = $db->prepare("
+    // ==================== REPORT: STUDENTS BY SUBJECT ====================
+    if ($type === 'by_subject'):
+        // Get all classes (subjects) with teacher and schedule info
+        $subjectsStmt = $pdo->prepare("
+            SELECT DISTINCT 
+                c.class_id,
+                sub.course_code,
+                sub.subject_name,
+                c.section,
+                t.name AS teacher_name,
+                (SELECT GROUP_CONCAT(DISTINCT day ORDER BY FIELD(day, 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday') SEPARATOR ', ') 
+                 FROM schedules WHERE class_id = c.class_id) AS days,
+                (SELECT GROUP_CONCAT(DISTINCT CONCAT(TIME_FORMAT(start_time,'%l:%i %p'),' - ',TIME_FORMAT(end_time,'%l:%i %p')) SEPARATOR ', ') 
+                 FROM schedules WHERE class_id = c.class_id) AS time_slots,
+                (SELECT GROUP_CONCAT(DISTINCT room SEPARATOR ', ') 
+                 FROM schedules WHERE class_id = c.class_id) AS rooms
+            FROM classes c
+            JOIN subjects sub ON c.course_code = sub.course_code
+            LEFT JOIN teachers t ON c.teacher_id = t.id
+            ORDER BY sub.subject_name, c.section
+        ");
+        $subjectsStmt->execute();
+        $subjects = $subjectsStmt->fetchAll();
+        
+        // For each subject, fetch enrolled students
+        if (empty($subjects)):
+    ?>
+        <h4 class="section-title">Students by Subject</h4>
+        <p class="no-data">No subjects found.</p>
+    <?php else: ?>
+        <h4 class="section-title">Students by Subject</h4>
+        <div class="mb-3">
+            <a href="reports.php?type=by_subject&date=<?= urlencode($date) ?>" class="btn btn-sm btn-primary">Refresh</a>
+        </div>
+        
+        <?php foreach ($subjects as $subject): 
+            // Get enrolled students for this class
+            $studentsStmt = $pdo->prepare("
+                SELECT s.id, s.student_number, s.full_name, s.course, s.section
+                FROM student_schedule ss
+                JOIN students s ON ss.student_id = s.id
+                WHERE ss.class_id = ?
+                ORDER BY s.full_name
+            ");
+            $studentsStmt->execute([$subject['class_id']]);
+            $students = $studentsStmt->fetchAll();
+            
+            // For the selected Monday, get attendance status for each student
+            if (!empty($students)):
+                $studentIds = array_column($students, 'id');
+                $placeholders = implode(',', array_fill(0, count($studentIds), '?'));
+                $attStmt = $pdo->prepare("
+                    SELECT student_id, status, time_in
+                    FROM attendance
+                    WHERE class_id = ? AND date = ? AND student_id IN ($placeholders)
+                ");
+                $params = array_merge([$subject['class_id'], $date], $studentIds);
+                $attStmt->execute($params);
+                $attendanceMap = [];
+                while ($row = $attStmt->fetch()) {
+                    $attendanceMap[$row['student_id']] = ['status' => $row['status'], 'time_in' => $row['time_in']];
+                }
+        ?>
+        <div class="subject-group">
+            <div class="subject-header">
+                <i class="bi bi-book-fill"></i> <?= htmlspecialchars($subject['subject_name']) ?> 
+                <span class="badge bg-light text-dark ms-2"><?= count($students) ?> students</span>
+            </div>
+            <div class="subject-schedule">
+                <span><i class="bi bi-code-slash"></i> <?= htmlspecialchars($subject['course_code']) ?></span>
+                <span><i class="bi bi-person-badge"></i> Teacher: <?= htmlspecialchars($subject['teacher_name'] ?? 'Not assigned') ?></span>
+                <span><i class="bi bi-calendar-week"></i> <?= htmlspecialchars($subject['days'] ?? 'TBA') ?></span>
+                <span><i class="bi bi-clock"></i> <?= htmlspecialchars($subject['time_slots'] ?? 'TBA') ?></span>
+                <span><i class="bi bi-geo-alt"></i> <?= htmlspecialchars($subject['rooms'] ?? 'TBA') ?></span>
+                <span><i class="bi bi-layout-split"></i> Section: <?= htmlspecialchars($subject['section']) ?></span>
+            </div>
+            <div class="student-list">
+                <div class="row g-2">
+                    <?php foreach ($students as $student):
+                        $att = $attendanceMap[$student['id']] ?? null;
+                        $status = $att['status'] ?? 'No Record';
+                        $badgeClass = match($status) {
+                            'Present' => 'badge-present',
+                            'Absent' => 'badge-absent',
+                            'Late' => 'badge-late',
+                            default => 'badge-excused'
+                        };
+                        $timeIn = $att['time_in'] ?? '';
+                    ?>
+                    <div class="col-md-6 col-lg-4">
+                        <div class="student-row">
+                            <div>
+                                <div class="student-name"><?= htmlspecialchars($student['full_name']) ?></div>
+                                <div class="student-id"><?= htmlspecialchars($student['student_number']) ?> | <?= htmlspecialchars($student['course']) ?>-<?= htmlspecialchars($student['section']) ?></div>
+                            </div>
+                            <div class="student-status">
+                                <span class="badge <?= $badgeClass ?>"><?= htmlspecialchars($status) ?></span>
+                                <?php if ($timeIn): ?><small class="text-muted ms-1"><?= date('g:i A', strtotime($timeIn)) ?></small><?php endif; ?>
+                            </div>
+                        </div>
+                    </div>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+        </div>
+        <?php 
+            endif; // end if students
+        endforeach; 
+        ?>
+    <?php endif; ?>
+
+    <?php
+    // ==================== DAILY ATTENDANCE ====================
+    elseif ($type === 'daily'):
+        $countStmt = $pdo->prepare("
             SELECT COUNT(*)
-            FROM attendance_data a
-            LEFT JOIN student_data sd ON a.user_id = sd.user_id
+            FROM attendance a
+            JOIN students s ON a.student_id = s.id
             WHERE a.date = ?
         ");
         $countStmt->execute([$date]);
@@ -157,26 +322,27 @@ function renderPagination($page, $totalPages) {
         $totalPages = max(1, (int)ceil($totalRows / $perPage));
         if ($page > $totalPages) { $page = $totalPages; $offset = ($page - 1) * $perPage; }
 
-        $rows = $db->prepare("
-            SELECT sd.name, sd.course, sd.section, a.user_id, a.status, a.check_in
-            FROM attendance_data a
-            LEFT JOIN student_data sd ON a.user_id = sd.user_id
+        $stmt = $pdo->prepare("
+            SELECT s.full_name AS name, s.course, s.section, s.student_number AS user_id,
+                   a.status, a.time_in AS check_in
+            FROM attendance a
+            JOIN students s ON a.student_id = s.id
             WHERE a.date = :date
-            ORDER BY sd.section, sd.name
+            ORDER BY s.section, s.full_name
             LIMIT :limit OFFSET :offset
         ");
-        $rows->bindValue(':date', $date);
-        $rows->bindValue(':limit', $perPage, PDO::PARAM_INT);
-        $rows->bindValue(':offset', $offset, PDO::PARAM_INT);
-        $rows->execute();
-        $records = $rows->fetchAll();
+        $stmt->bindValue(':date', $date);
+        $stmt->bindValue(':limit', $perPage, PDO::PARAM_INT);
+        $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+        $stmt->execute();
+        $records = $stmt->fetchAll();
 
-        $totals = $db->prepare("
+        $totals = $pdo->prepare("
             SELECT COUNT(*) AS total,
-                   SUM(status='Present') AS present,
-                   SUM(status='Absent')  AS absent,
-                   SUM(status='Late')    AS late
-            FROM attendance_data
+                   SUM(status = 'Present') AS present,
+                   SUM(status = 'Absent')  AS absent,
+                   SUM(status = 'Late')    AS late
+            FROM attendance
             WHERE date = ?
         ");
         $totals->execute([$date]);
@@ -200,7 +366,7 @@ function renderPagination($page, $totalPages) {
                 </thead>
                 <tbody>
                     <?php foreach ($records as $i => $row):
-                        $bc = match($row['status']) { 'Present'=>'badge-present','Absent'=>'badge-absent','Late'=>'badge-late',default=>'badge-excused' };
+                        $bc = match($row['status']) { 'Present'=>'badge-present','Absent'=>'badge-absent','Late'=>'badge-late', default=>'badge-excused' };
                     ?>
                     <tr>
                         <td><?= $offset + $i + 1 ?></td>
@@ -219,16 +385,16 @@ function renderPagination($page, $totalPages) {
         <?php endif; ?>
 
     <?php
-
+    // ==================== STUDENT SUMMARY ====================
     elseif ($type === 'summary'):
-        $totalRows  = (int)$db->query("SELECT COUNT(*) FROM student_data")->fetchColumn();
+        $totalRows  = (int)$pdo->query("SELECT COUNT(*) FROM students")->fetchColumn();
         $totalPages = max(1, (int)ceil($totalRows / $perPage));
         if ($page > $totalPages) { $page = $totalPages; $offset = ($page - 1) * $perPage; }
 
-        $studentsStmt = $db->prepare("
-            SELECT user_id, name, course, section
-            FROM student_data
-            ORDER BY section, name
+        $studentsStmt = $pdo->prepare("
+            SELECT student_number AS user_id, full_name AS name, course, section
+            FROM students
+            ORDER BY section, full_name
             LIMIT :limit OFFSET :offset
         ");
         $studentsStmt->bindValue(':limit', $perPage, PDO::PARAM_INT);
@@ -248,13 +414,14 @@ function renderPagination($page, $totalPages) {
                 </thead>
                 <tbody>
                     <?php foreach ($students as $i => $stu):
-                        $att = $db->prepare("
+                        $att = $pdo->prepare("
                             SELECT COUNT(*) AS total,
-                                   SUM(status='Present') AS present,
-                                   SUM(status='Absent')  AS absent,
-                                   SUM(status='Late')    AS late
-                            FROM attendance_data
-                            WHERE user_id = ? AND DAYOFWEEK(date) = 2
+                                   SUM(status = 'Present') AS present,
+                                   SUM(status = 'Absent')  AS absent,
+                                   SUM(status = 'Late')    AS late
+                            FROM attendance
+                            WHERE student_id = (SELECT id FROM students WHERE student_number = ?)
+                              AND DAYOFWEEK(date) = 2
                         ");
                         $att->execute([$stu['user_id']]);
                         $a    = $att->fetch();
@@ -286,56 +453,63 @@ function renderPagination($page, $totalPages) {
         <?php endif; ?>
 
     <?php
-
+    // ==================== INDIVIDUAL STUDENT HISTORY ====================
     elseif ($type === 'student' && $userId):
-        $profile = $db->prepare("SELECT user_id, name, course, section, gender, contact FROM student_data WHERE user_id = ?");
-        $profile->execute([$userId]);
-        $info = $profile->fetch();
+        // Get student internal id
+        $studentIdStmt = $pdo->prepare("SELECT id, full_name, course, section, student_number, contact FROM students WHERE student_number = ?");
+        $studentIdStmt->execute([$userId]);
+        $info = $studentIdStmt->fetch();
+        if (!$info) {
+            echo '<p class="no-data">Student not found.</p>';
+        } else {
+            $studentDbId = $info['id'];
 
-        $countStmt = $db->prepare("SELECT COUNT(*) FROM attendance_data WHERE user_id = ? AND DAYOFWEEK(date) = 2");
-        $countStmt->execute([$userId]);
-        $totalRows  = (int)$countStmt->fetchColumn();
-        $totalPages = max(1, (int)ceil($totalRows / $perPage));
-        if ($page > $totalPages) { $page = $totalPages; $offset = ($page - 1) * $perPage; }
+            $countStmt = $pdo->prepare("
+                SELECT COUNT(*)
+                FROM attendance
+                WHERE student_id = ? AND DAYOFWEEK(date) = 2
+            ");
+            $countStmt->execute([$studentDbId]);
+            $totalRows  = (int)$countStmt->fetchColumn();
+            $totalPages = max(1, (int)ceil($totalRows / $perPage));
+            if ($page > $totalPages) { $page = $totalPages; $offset = ($page - 1) * $perPage; }
 
-        $history = $db->prepare("
-            SELECT date, status, check_in
-            FROM attendance_data
-            WHERE user_id = :user_id AND DAYOFWEEK(date) = 2
-            ORDER BY date DESC
-            LIMIT :limit OFFSET :offset
-        ");
-        $history->bindValue(':user_id', $userId);
-        $history->bindValue(':limit', $perPage, PDO::PARAM_INT);
-        $history->bindValue(':offset', $offset, PDO::PARAM_INT);
-        $history->execute();
-        $records = $history->fetchAll();
+            $history = $pdo->prepare("
+                SELECT date, status, time_in AS check_in
+                FROM attendance
+                WHERE student_id = :student_id AND DAYOFWEEK(date) = 2
+                ORDER BY date DESC
+                LIMIT :limit OFFSET :offset
+            ");
+            $history->bindValue(':student_id', $studentDbId, PDO::PARAM_INT);
+            $history->bindValue(':limit', $perPage, PDO::PARAM_INT);
+            $history->bindValue(':offset', $offset, PDO::PARAM_INT);
+            $history->execute();
+            $records = $history->fetchAll();
 
-        $attStats = $db->prepare("
-            SELECT COUNT(*) AS total,
-                   SUM(status='Present') AS present,
-                   SUM(status='Absent')  AS absent,
-                   SUM(status='Late')    AS late
-            FROM attendance_data
-            WHERE user_id = ? AND DAYOFWEEK(date) = 2
-        ");
-        $attStats->execute([$userId]);
-        $as   = $attStats->fetch();
-        $rate = ($as['total'] ?? 0) > 0 ? round(($as['present'] / $as['total']) * 100, 1) : 0;
-    ?>
-        <h4 class="section-title"><?= htmlspecialchars($info['name'] ?? $userId) ?>'s Monday History</h4>
+            $attStats = $pdo->prepare("
+                SELECT COUNT(*) AS total,
+                       SUM(status = 'Present') AS present,
+                       SUM(status = 'Absent')  AS absent,
+                       SUM(status = 'Late')    AS late
+                FROM attendance
+                WHERE student_id = ? AND DAYOFWEEK(date) = 2
+            ");
+            $attStats->execute([$studentDbId]);
+            $as   = $attStats->fetch();
+            $rate = ($as['total'] ?? 0) > 0 ? round(($as['present'] / $as['total']) * 100, 1) : 0;
+        ?>
+        <h4 class="section-title"><?= htmlspecialchars($info['full_name'] ?? $userId) ?>'s Monday History</h4>
 
-        <?php if ($info): ?>
         <div class="row mb-3">
             <div class="col-md-6">
                 <p class="text-muted mb-1">
                     <strong>Course:</strong> <?= htmlspecialchars($info['course']) ?>
                     &nbsp;|&nbsp; <strong>Section:</strong> <?= htmlspecialchars($info['section']) ?>
-                    &nbsp;|&nbsp; <strong>ID:</strong> <?= htmlspecialchars($info['user_id']) ?>
+                    &nbsp;|&nbsp; <strong>ID:</strong> <?= htmlspecialchars($info['student_number']) ?>
                 </p>
                 <p class="text-muted mb-1">
-                    <strong>Gender:</strong> <?= ($info['gender'] ?? '') == 'M' ? 'Male' : 'Female' ?>
-                    &nbsp;|&nbsp; <strong>Contact:</strong> <?= htmlspecialchars($info['contact'] ?? 'N/A') ?>
+                    <strong>Contact:</strong> <?= htmlspecialchars($info['contact'] ?? 'N/A') ?>
                 </p>
             </div>
             <div class="col-md-6">
@@ -350,7 +524,6 @@ function renderPagination($page, $totalPages) {
                 </div>
             </div>
         </div>
-        <?php endif; ?>
 
         <?php if (empty($records)): ?>
             <p class="no-data">No Monday attendance records found for this student.</p>
@@ -362,7 +535,7 @@ function renderPagination($page, $totalPages) {
                 </thead>
                 <tbody>
                     <?php foreach ($records as $i => $r):
-                        $bc = match($r['status']) { 'Present'=>'badge-present','Absent'=>'badge-absent','Late'=>'badge-late',default=>'badge-excused' };
+                        $bc = match($r['status']) { 'Present'=>'badge-present','Absent'=>'badge-absent','Late'=>'badge-late', default=>'badge-excused' };
                     ?>
                     <tr>
                         <td><?= $offset + $i + 1 ?></td>
@@ -375,36 +548,37 @@ function renderPagination($page, $totalPages) {
             </table>
         </div>
         <?php renderPagination($page, $totalPages); ?>
-        <?php endif; ?>
+        <?php endif; 
+        } // end if student found ?>
 
     <?php
-
+    // ==================== STATISTICS BY COURSE/SECTION ====================
     elseif ($type === 'statistics'):
-        $countStmt = $db->query("
+        $countStmt = $pdo->query("
             SELECT COUNT(*) FROM (
-                SELECT sd.course, sd.section
-                FROM attendance_data a
-                JOIN student_data sd ON a.user_id = sd.user_id
+                SELECT s.course, s.section
+                FROM attendance a
+                JOIN students s ON a.student_id = s.id
                 WHERE DAYOFWEEK(a.date) = 2
-                GROUP BY sd.course, sd.section
+                GROUP BY s.course, s.section
             ) AS g
         ");
         $totalRows  = (int)$countStmt->fetchColumn();
         $totalPages = max(1, (int)ceil($totalRows / $perPage));
         if ($page > $totalPages) { $page = $totalPages; $offset = ($page - 1) * $perPage; }
 
-        $statsStmt = $db->prepare("
-            SELECT sd.course, sd.section,
+        $statsStmt = $pdo->prepare("
+            SELECT s.course, s.section,
                    COUNT(*) AS total_records,
-                   SUM(a.status='Present') AS present,
-                   SUM(a.status='Absent')  AS absent,
-                   SUM(a.status='Late')    AS late,
-                   ROUND(SUM(a.status='Present') / COUNT(*) * 100, 2) AS rate
-            FROM attendance_data a
-            JOIN student_data sd ON a.user_id = sd.user_id
+                   SUM(a.status = 'Present') AS present,
+                   SUM(a.status = 'Absent')  AS absent,
+                   SUM(a.status = 'Late')    AS late,
+                   ROUND(SUM(a.status = 'Present') / COUNT(*) * 100, 2) AS rate
+            FROM attendance a
+            JOIN students s ON a.student_id = s.id
             WHERE DAYOFWEEK(a.date) = 2
-            GROUP BY sd.course, sd.section
-            ORDER BY sd.course, sd.section
+            GROUP BY s.course, s.section
+            ORDER BY s.course, s.section
             LIMIT :limit OFFSET :offset
         ");
         $statsStmt->bindValue(':limit', $perPage, PDO::PARAM_INT);
@@ -445,109 +619,13 @@ function renderPagination($page, $totalPages) {
         <?php endif; ?>
 
     <?php
-
-    elseif ($type === 'subject' && $subjectId):
-        $sub = $db->prepare("SELECT subject_id, subject_code, subject_name, teacher_name, course, section, room, schedule FROM subjects WHERE subject_id = ?");
-        $sub->execute([$subjectId]);
-        $subject = $sub->fetch();
-
-        $countStmt = $db->prepare("SELECT COUNT(*) FROM subject_enrollment WHERE subject_id = ?");
-        $countStmt->execute([$subjectId]);
-        $totalRows  = (int)$countStmt->fetchColumn();
-        $totalPages = max(1, (int)ceil($totalRows / $perPage));
-        if ($page > $totalPages) { $page = $totalPages; $offset = ($page - 1) * $perPage; }
-
-        $rows = $db->prepare("
-            SELECT sd.name, sd.user_id, sd.course, sd.section, a.status, a.check_in
-            FROM subject_enrollment se
-            JOIN student_data sd ON se.user_id = sd.user_id
-            LEFT JOIN attendance_data a ON a.user_id = se.user_id AND a.date = :date
-            WHERE se.subject_id = :subject_id
-            ORDER BY sd.name
-            LIMIT :limit OFFSET :offset
-        ");
-        $rows->bindValue(':date', $date);
-        $rows->bindValue(':subject_id', (int)$subjectId, PDO::PARAM_INT);
-        $rows->bindValue(':limit', $perPage, PDO::PARAM_INT);
-        $rows->bindValue(':offset', $offset, PDO::PARAM_INT);
-        $rows->execute();
-        $records = $rows->fetchAll();
-
-        $summaryRows = $db->prepare("
-            SELECT a.status
-            FROM subject_enrollment se
-            JOIN student_data sd ON se.user_id = sd.user_id
-            LEFT JOIN attendance_data a ON a.user_id = se.user_id AND a.date = ?
-            WHERE se.subject_id = ?
-        ");
-        $summaryRows->execute([$date, $subjectId]);
-        $allSubjectRows = $summaryRows->fetchAll();
-
-        $present = $absent = $late = $noRecord = 0;
-        foreach ($allSubjectRows as $r) {
-            $st = $r['status'] ?? 'No Record';
-            if ($st === 'Present') $present++;
-            elseif ($st === 'Absent') $absent++;
-            elseif ($st === 'Late') $late++;
-            else $noRecord++;
-        }
-    ?>
-        <h4 class="section-title">
-            <?= htmlspecialchars($subject['subject_code'] ?? '') ?> &mdash; <?= htmlspecialchars($subject['subject_name'] ?? '') ?>
-        </h4>
-
-        <?php if ($subject): ?>
-        <p class="text-muted">
-            <strong><?= htmlspecialchars($subject['teacher_name']) ?></strong>
-            &nbsp;|&nbsp; Section <?= htmlspecialchars($subject['section']) ?>
-            &nbsp;|&nbsp; <span class="badge bg-success"><?= htmlspecialchars($subject['room'] ?? 'COM LAB A') ?></span>
-            &nbsp;|&nbsp; <?= htmlspecialchars($subject['schedule'] ?? 'Schedule not available') ?>
-        </p>
-        <p class="text-muted">Date: <strong><?= date('F j, Y', strtotime($date)) ?></strong></p>
-        <div class="row mb-3">
-            <div class="col-auto"><span class="badge bg-secondary">Enrolled: <?= count($allSubjectRows) ?></span></div>
-            <div class="col-auto"><span class="badge badge-present">Present: <?= $present ?></span></div>
-            <div class="col-auto"><span class="badge badge-absent">Absent: <?= $absent ?></span></div>
-            <div class="col-auto"><span class="badge badge-late">Late: <?= $late ?></span></div>
-            <div class="col-auto"><span class="badge bg-secondary">No Record: <?= $noRecord ?></span></div>
-        </div>
-        <?php endif; ?>
-
-        <?php if (empty($records)): ?>
-            <p class="no-data">No enrollment or attendance data for this subject yet.</p>
-        <?php else: ?>
-        <div class="table-responsive">
-            <table class="table table-bordered table-hover bg-white" id="reportTable">
-                <thead class="table-primary">
-                    <tr><th>#</th><th>Student Name</th><th>User ID</th><th>Course / Section</th><th>Status</th><th>Check-in Time</th></tr>
-                </thead>
-                <tbody>
-                    <?php foreach ($records as $i => $row):
-                        $rowStatus = $row['status'] ?? 'No Record';
-                        $bc = match($rowStatus) { 'Present'=>'badge-present','Absent'=>'badge-absent','Late'=>'badge-late','Excused'=>'badge-excused',default=>'bg-secondary' };
-                    ?>
-                    <tr>
-                        <td><?= $offset + $i + 1 ?></td>
-                        <td><?= htmlspecialchars($row['name']) ?></td>
-                        <td><?= htmlspecialchars($row['user_id']) ?></td>
-                        <td><?= htmlspecialchars($row['course']) ?>-<?= htmlspecialchars($row['section']) ?></td>
-                        <td><span class="badge <?= $bc ?>"><?= htmlspecialchars($rowStatus) ?></span></td>
-                        <td><?= htmlspecialchars($row['check_in'] ?? '-') ?></td>
-                    </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-        </div>
-        <?php renderPagination($page, $totalPages); ?>
-        <?php endif; ?>
-
-    <?php
-
+    // ==================== STATUS BREAKDOWN ====================
     elseif ($type === 'status_breakdown' && in_array($status, ['Present', 'Absent', 'Late'])):
 
-        $countStmt = $db->prepare("
+        $countStmt = $pdo->prepare("
             SELECT COUNT(*)
-            FROM attendance_data a
+            FROM attendance a
+            JOIN students s ON a.student_id = s.id
             WHERE a.date = ?
               AND a.status = ?
         ");
@@ -559,17 +637,16 @@ function renderPagination($page, $totalPages) {
             $offset = ($page - 1) * $perPage;
         }
 
-        $stmt = $db->prepare("
-            SELECT sd.name, sd.user_id, sd.course, sd.section, a.status, a.check_in
-            FROM attendance_data a
-            LEFT JOIN student_data sd ON sd.user_id = a.user_id
-            WHERE a.date = ?
-              AND a.status = ?
-            ORDER BY sd.section, sd.name
+        $stmt = $pdo->prepare("
+            SELECT s.full_name AS name, s.student_number AS user_id, s.course, s.section, a.status, a.time_in AS check_in
+            FROM attendance a
+            JOIN students s ON a.student_id = s.id
+            WHERE a.date = :date AND a.status = :status
+            ORDER BY s.section, s.full_name
             LIMIT :limit OFFSET :offset
         ");
-        $stmt->bindValue(1, $date);
-        $stmt->bindValue(2, $status);
+        $stmt->bindValue(':date', $date);
+        $stmt->bindValue(':status', $status);
         $stmt->bindValue(':limit', $perPage, PDO::PARAM_INT);
         $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
         $stmt->execute();
@@ -593,19 +670,11 @@ function renderPagination($page, $totalPages) {
         <div class="table-responsive">
             <table class="table table-bordered table-hover bg-white" id="reportTable">
                 <thead class="table-primary">
-                    <tr>
-                        <th>#</th>
-                        <th>Name</th>
-                        <th>User ID</th>
-                        <th>Course</th>
-                        <th>Section</th>
-                        <th>Status</th>
-                        <th>Check-in Time</th>
-                    </tr>
+                    <tr><th>#</th><th>Name</th><th>User ID</th><th>Course</th><th>Section</th><th>Status</th><th>Check-in Time</th></tr>
                 </thead>
                 <tbody>
                     <?php foreach ($records as $i => $row):
-                        $bc = match($row['status']) { 'Present'=>'badge-present','Absent'=>'badge-absent','Late'=>'badge-late',default=>'badge-excused' };
+                        $bc = match($row['status']) { 'Present'=>'badge-present','Absent'=>'badge-absent','Late'=>'badge-late', default=>'badge-excused' };
                     ?>
                     <tr>
                         <td><?= $offset + $i + 1 ?></td>
@@ -638,7 +707,7 @@ function exportPDF() {
 
     doc.setFontSize(14);
     doc.setFont('helvetica', 'bold');
-    doc.text('G6 - Reports & Analytics Subsystem', 14, 15);
+    doc.text('Attendance Reports & Analytics', 14, 15);
 
     doc.setFontSize(10);
     doc.setFont('helvetica', 'normal');
@@ -652,31 +721,35 @@ function exportPDF() {
     }
 
     const table = document.getElementById('reportTable');
-    if (!table) { alert('No table data to export!'); return; }
-
-    const headers = [];
-    table.querySelectorAll('thead tr th').forEach(th => {
-        if (!th.classList.contains('no-print')) headers.push(th.innerText.trim());
-    });
-
-    const rows = [];
-    table.querySelectorAll('tbody tr').forEach(tr => {
-        const row = [];
-        tr.querySelectorAll('td').forEach(td => {
-            if (!td.classList.contains('no-print')) row.push(td.innerText.trim());
+    if (table) {
+        const headers = [];
+        table.querySelectorAll('thead tr th').forEach(th => {
+            if (!th.classList.contains('no-print')) headers.push(th.innerText.trim());
         });
-        rows.push(row);
-    });
 
-    doc.autoTable({
-        head: [headers],
-        body: rows,
-        startY: 42,
-        styles: { fontSize: 9, cellPadding: 3 },
-        headStyles: { fillColor: [78, 115, 223], textColor: 255, fontStyle: 'bold' },
-        alternateRowStyles: { fillColor: [245, 247, 255] },
-        margin: { left: 14, right: 14 }
-    });
+        const rows = [];
+        table.querySelectorAll('tbody tr').forEach(tr => {
+            const row = [];
+            tr.querySelectorAll('td').forEach(td => {
+                if (!td.classList.contains('no-print')) row.push(td.innerText.trim());
+            });
+            rows.push(row);
+        });
+
+        doc.autoTable({
+            head: [headers],
+            body: rows,
+            startY: 42,
+            styles: { fontSize: 9, cellPadding: 3 },
+            headStyles: { fillColor: [78, 115, 223], textColor: 255, fontStyle: 'bold' },
+            alternateRowStyles: { fillColor: [245, 247, 255] },
+            margin: { left: 14, right: 14 }
+        });
+    } else {
+        // For by_subject report which uses grouped layout, we need a different approach
+        // Simple fallback: alert user
+        alert('PDF export for grouped subject report is not fully supported. Please use print.');
+    }
 
     const pageCount = doc.internal.getNumberOfPages();
     for (let i = 1; i <= pageCount; i++) {
@@ -684,14 +757,14 @@ function exportPDF() {
         doc.setFontSize(8);
         doc.setTextColor(150);
         doc.text(
-            'G6 Reports & Analytics | Page ' + i + ' of ' + pageCount,
+            'Attendance Reports | Page ' + i + ' of ' + pageCount,
             doc.internal.pageSize.getWidth() / 2,
             doc.internal.pageSize.getHeight() - 8,
             { align: 'center' }
         );
     }
 
-    doc.save('G6_<?= $type ?>_<?= $date ?>.pdf');
+    doc.save('Attendance_<?= $type ?>_<?= $date ?>.pdf');
 }
 </script>
 </body>
