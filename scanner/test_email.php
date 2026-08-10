@@ -6,6 +6,18 @@
 // ============================================================================
 require_once __DIR__ . '/../includes/guard.php';   // admins/super_admins only
 require_once __DIR__ . '/../includes/mailer.php';
+require_once __DIR__ . '/../includes/mailer.php';
+
+$result = sendMailSMTP(
+    'yourtestemail@gmail.com',
+    'Test User',
+    'SMTP Test',
+    '<h1>Email Test Successful</h1>',
+    'Email Test Successful'
+);
+
+header('Content-Type: application/json');
+echo json_encode($result, JSON_PRETTY_PRINT);
 
 $result = null;
 $sentTo = '';

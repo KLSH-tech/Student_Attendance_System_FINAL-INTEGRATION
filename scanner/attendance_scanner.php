@@ -329,7 +329,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
     $allFormattedSchedules = formatSchedulesForDisplay($allSchedules);
     $todayFormattedSchedules = formatSchedulesForDisplay($todaySchedules);
     
-    // Find active schedule
+    // ── STATE-AWARE schedule selection ──────────────────────────────────────
+    // A class is "active" only while now is within [start_time, end_time]. That
+    // single window covers BOTH:
+    //   • CASE 1 (within grace): present, and
+    //   • CASE 2 (after grace, before end): late / absent→late conversion.
+    // If no class is active we must distinguish CASE 3 (a class already ENDED →
+    // attendance closed, reject the scan) from simply being between/before
+    // classes. The old unconditional "use first schedule" TEST-MODE fallback is
+    // removed because it let scans be recorded after a class had ended.
     $activeSchedule = null;
     foreach ($todaySchedules as $schedule) {
         if (isWithinSchedule($schedule, $now)) {
@@ -338,13 +346,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
             break;
         }
     }
-    
-    // If no active schedule but has schedules today, use first one for testing
-    if (!$activeSchedule && !empty($todaySchedules)) {
-        $activeSchedule = $todaySchedules[0];
-        error_log("⚠️ TEST MODE: Using first schedule: {$activeSchedule['subject_name']}");
+
+    // When nothing is active, find the most-recently-ENDED class for today.
+    $endedSchedule = null;
+    if (!$activeSchedule) {
+        foreach ($todaySchedules as $schedule) {
+            $endDT = DateTime::createFromFormat('H:i:s', $schedule['end_time']);
+            if (!$endDT) { continue; }
+            $endDT->setDate((int)$now->format('Y'), (int)$now->format('m'), (int)$now->format('d'));
+            if ($now > $endDT) {
+                if ($endedSchedule === null) {
+                    $endedSchedule = $schedule;
+                } else {
+                    $prevEnd = DateTime::createFromFormat('H:i:s', $endedSchedule['end_time']);
+                    $prevEnd->setDate((int)$now->format('Y'), (int)$now->format('m'), (int)$now->format('d'));
+                    if ($endDT > $prevEnd) { $endedSchedule = $schedule; }   // keep latest ended
+                }
+            }
+        }
     }
-    
+
     if (empty($todaySchedules)) {
         $conn->close();
         echo json_encode([
@@ -362,8 +383,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
         ]);
         exit;
     }
-    
+
     if (!$activeSchedule) {
+        // CASE 3 — the (most recent) class today has already ended → attendance
+        // is CLOSED. We do NOT mark late and do NOT touch any attendance record.
+        if ($endedSchedule) {
+            $endLabel  = date('h:i A', strtotime($endedSchedule['end_time']));
+            $subjLabel = $endedSchedule['subject_name'] ?? 'this subject';
+            $conn->close();
+            echo json_encode([
+                'success'        => false,
+                'no_class'       => true,
+                'closed'         => true,                       // attendance window expired
+                'message'        => "Attendance closed — {$subjLabel} already ended at {$endLabel}.",
+                'today_subjects' => $todayFormattedSchedules,
+                'all_subjects'   => $allFormattedSchedules,
+                'student_name'   => $fullName,
+                'student_details'=> [
+                    'course'     => $course,
+                    'year_level' => $yearLevel,
+                    'section'    => $section
+                ]
+            ]);
+            exit;
+        }
+        // Otherwise: between classes or before the first one — unchanged behavior.
         $conn->close();
         echo json_encode([
             'success' => false,
@@ -395,20 +439,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
     $scheduleId = (int) $activeSchedule['schedule_id'];
     $classId = (int) $activeSchedule['class_id'];
     
-    // Check last attendance action
+    // ── STATE-AWARE last-action detection ───────────────────────────────────
+    // An auto-ABSENT row must NOT count as a real scan for the IN/OUT toggle —
+    // otherwise the student's first real scan would wrongly flip to 'out'. So we
+    // read the last *real* (in/out) action for the toggle and the debounce, and
+    // SEPARATELY detect a convertible auto-absent row.
     $stmt = $conn->prepare("
-        SELECT action, attendance_status, logged_at 
+        SELECT action, logged_at
         FROM attendance_logs
         WHERE student_id = ? AND schedule_id = ? AND class_id = ? AND DATE(logged_at) = ?
+          AND action IN ('in','out')
         ORDER BY log_id DESC LIMIT 1
     ");
     $stmt->bind_param('iiis', $studentPk, $scheduleId, $classId, $todayDate);
     $stmt->execute();
-    $lastLog = $stmt->get_result()->fetch_assoc();
+    $lastReal = $stmt->get_result()->fetch_assoc();
     $stmt->close();
-    
-    $lastAction = $lastLog['action'] ?? null;
-    $action = (!$lastAction || $lastAction === 'out') ? 'in' : 'out';
+
+    $lastAction = $lastReal['action'] ?? null;
+    $lastLog    = $lastReal;                       // debounce uses real scans only
+    $action     = (!$lastAction || $lastAction === 'out') ? 'in' : 'out';
+
+    // Is there an auto-absent row to convert? (Only meaningful when the student
+    // has NOT scanned for real yet — i.e. CASE 2: absent first, now scanning in.)
+    $absentRowId = 0;
+    if ($lastAction === null) {
+        $stmt = $conn->prepare("
+            SELECT log_id FROM attendance_logs
+            WHERE student_id = ? AND schedule_id = ? AND class_id = ? AND DATE(logged_at) = ?
+              AND action = 'absent' AND attendance_status = 'absent'
+            ORDER BY log_id DESC LIMIT 1
+        ");
+        $stmt->bind_param('iiis', $studentPk, $scheduleId, $classId, $todayDate);
+        $stmt->execute();
+        $absentRowId = (int) ($stmt->get_result()->fetch_assoc()['log_id'] ?? 0);
+        $stmt->close();
+    }
+    // CASE 2: previously auto-absent, now scanning in → convert that row to LATE.
+    $previouslyAbsent = ($absentRowId > 0 && $action === 'in');
 
     // Anti double-read only: a barcode scanner often fires the SAME code twice
     // within a fraction of a second. Block just those near-instant repeats so a
@@ -486,25 +554,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
     $smsSentInt = $smsSent ? 1 : 0;
     $scannedBy = 'student_terminal';
 
-    $stmt = $conn->prepare("
-        INSERT INTO attendance_logs 
-            (student_id, student_number, class_id, schedule_id, scanned_by, action, 
-             attendance_status, sms_sent, logged_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ");
-    $stmt->bind_param(
-        // i  s  i  i  s  s  s  i  s   ← attendance_status (pos 7) is a STRING.
-        // The original 'isiissiis' bound it as an int, so 'on_time'/'late' became
-        // 0 and the enum stored '' (see the blank values in the seed data) or, on
-        // a strict-mode server, errored with "Data truncated". This is the fix.
-        'isiisssis',
-        $studentPk, $studentNumber, $classId, $scheduleId, $scannedBy,
-        $action, $status, $smsSentInt, $loggedAt
-    );
-    $stmt->execute();
-    $logId = (int) $conn->insert_id;
-    $stmt->close();
+    if ($previouslyAbsent) {
+        // ── CASE 2 CONVERSION ────────────────────────────────────────────────
+        // The student was auto-marked ABSENT after the grace period; they are
+        // now physically scanning in while the class is still in session. We
+        // CONVERT the existing auto-absent row in place (action absent→in,
+        // status absent→late) instead of inserting a new row. This guarantees
+        // there is never a contradictory absent+late pair and never a duplicate.
+        $stmt = $conn->prepare("
+            UPDATE attendance_logs
+            SET action = 'in', attendance_status = ?, scanned_by = ?, sms_sent = ?, logged_at = ?
+            WHERE log_id = ?
+        ");
+        $stmt->bind_param('ssisi', $status, $scannedBy, $smsSentInt, $loggedAt, $absentRowId);
+        $stmt->execute();
+        $stmt->close();
+        $logId = $absentRowId;
+        error_log("ABSENT→LATE: converted auto-absent log #{$absentRowId} to late time-in for {$fullName}");
+    } else {
+        $stmt = $conn->prepare("
+            INSERT INTO attendance_logs 
+                (student_id, student_number, class_id, schedule_id, scanned_by, action, 
+                 attendance_status, sms_sent, logged_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ");
+        $stmt->bind_param(
+            // i  s  i  i  s  s  s  i  s   ← attendance_status (pos 7) is a STRING.
+            // The original 'isiissiis' bound it as an int, so 'on_time'/'late' became
+            // 0 and the enum stored '' (see the blank values in the seed data) or, on
+            // a strict-mode server, errored with "Data truncated". This is the fix.
+            'isiisssis',
+            $studentPk, $studentNumber, $classId, $scheduleId, $scannedBy,
+            $action, $status, $smsSentInt, $loggedAt
+        );
+        $stmt->execute();
+        $logId = (int) $conn->insert_id;
+        $stmt->close();
+    }
 
+    // Mirror into the summary table (per student/class/day). On conversion this
+    // updates the existing 'Absent' summary row to 'Late' + stamps time_in.
     syncAttendanceSummary(
     $conn,
     $studentPk,
@@ -521,6 +610,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
                  ?? $activeSchedule['instructor_full_name']
                  ?? 'TBA';
     $statusText  = ($action === 'out') ? 'Checked Out' : ($isLate ? 'Late' : 'On Time');
+    if ($previouslyAbsent) {
+        // Tell the parent the status changed from the earlier auto-absence.
+        $statusText = 'Late (updated from Absent)';
+    }
 
     $emailResult = notifyParentByEmail([
         'student_id'      => $studentPk,
@@ -544,6 +637,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
     ]);
     $emailSent   = ($emailResult['status'] === 'sent' || $emailResult['status'] === 'test');
     $emailStatus = $emailResult['status'];
+    $emailError = $emailResult['error'] ?? '';
 
     // Persist notification flags on the log row we just created.
     $emailSentInt = $emailSent ? 1 : 0;
@@ -572,6 +666,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
             $icon = '👋';
             $statusLabel = '● TIME IN';
         }
+        if ($previouslyAbsent) {
+            // CASE 2 — clearly explain the status change on the terminal.
+            $greeting    = "{$firstName} was previously marked ABSENT and is now marked LATE.";
+            $icon        = '🔄';
+            $statusLabel = '● ABSENT → LATE';
+        }
     } else {
         $greeting = "Goodbye, {$firstName}! See you next time!";
         $icon = '🚀';
@@ -590,6 +690,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['student_id'])) {
         'status_label' => $statusLabel,
         'is_late' => $isLate,
         'minutes_late' => $minutesLate,
+        'was_absent' => $previouslyAbsent,   // true when this scan converted an auto-absence to late
         'subject_name' => $activeSchedule['subject_name'],
         'subject_code' => $activeSchedule['subject_code'] ?? $activeSchedule['course_code'],
         'section_name' => $activeSchedule['section'],
@@ -823,17 +924,55 @@ input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDef
 
 function submitScan(id) {
     input.value = '';
+
     const fd = new FormData();
     fd.append('student_id', id);
+
     fetch(window.location.href, { method: 'POST', body: fd })
         .then(r => r.json())
         .then(data => {
-            if (data.success) showSuccess(data);
-            else if (data.not_found) showNotFound(id);
-            else if (data.no_class) showNoClass(data, id);
-            else if (data.duplicate) showDuplicate(data, id);
+
+            // Email debug data
+            const emailStatus = data.email_status || '';
+            const emailError = data.email_error || '';
+            const emailRecipient = data.email_recipient || '';
+
+            console.log('Email Status:', emailStatus);
+            console.log('Email Error:', emailError);
+            console.log('Email Recipient:', emailRecipient);
+
+            if (data.success) {
+                showSuccess({
+                    ...data,
+                    email_status: emailStatus,
+                    email_error: emailError,
+                    email_recipient: emailRecipient
+                });
+            }
+            else if (data.not_found) {
+                showNotFound(id);
+            }
+            else if (data.no_class) {
+                showNoClass({
+                    ...data,
+                    email_status: emailStatus,
+                    email_error: emailError,
+                    email_recipient: emailRecipient
+                }, id);
+            }
+            else if (data.duplicate) {
+                showDuplicate({
+                    ...data,
+                    email_status: emailStatus,
+                    email_error: emailError,
+                    email_recipient: emailRecipient
+                }, id);
+            }
         })
-        .catch((err) => { console.error('Fetch error:', err); showNotFound(id); })
+        .catch((err) => {
+            console.error('Fetch error:', err);
+            showNotFound(id);
+        })
         .finally(() => setTimeout(() => input.focus(), 10));
 }
 

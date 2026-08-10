@@ -29,7 +29,7 @@
 // ============================================================================
 
 require_once __DIR__ . '/db.php';   // db() — the single shared PDO connection
-require_once '../includes/absent_processor.php';
+require_once __DIR__ . '/mailer.php'; // reuse the EXISTING email pipeline for absences
 
 if (!function_exists('absentLog')) {
     /** Best-effort debug log. Never throws. */
@@ -105,6 +105,7 @@ if (!function_exists('processAutomaticAbsences')) {
             'date'             => $date,
             'logs_inserted'    => 0,
             'summary_inserted' => 0,
+            'emails_sent'      => 0,
             'schedules'        => 0,
             'error'            => '',
         ];
@@ -262,6 +263,16 @@ if (!function_exists('processAutomaticAbsences')) {
                 $result['logs_inserted'], $result['summary_inserted'],
                 $onlyScheduleId !== null ? " [schedule {$onlyScheduleId}]" : ''
             ));
+
+            // E-MAIL: after the (fast, committed) inserts, notify parents of any
+            // absent rows that haven't been e-mailed yet. Done OUTSIDE the
+            // transaction and best-effort, so a slow/failed SMTP can never roll
+            // back or break the marking. Idempotent: only rows with email_sent=0.
+            try {
+                $result['emails_sent'] = sendPendingAbsentEmails($date);
+            } catch (\Throwable $mailEx) {
+                absentLog('absent e-mail step failed: ' . $mailEx->getMessage());
+            }
         } catch (\Throwable $e) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
@@ -272,6 +283,135 @@ if (!function_exists('processAutomaticAbsences')) {
         }
 
         return $result;
+    }
+}
+
+if (!function_exists('sendPendingAbsentEmails')) {
+    /**
+     * Notify parents/guardians of ABSENT students, reusing the EXISTING e-mail
+     * pipeline (notifyParentByEmail → buildAttendanceEmail → email_log). One
+     * e-mail per auto-absent log row whose email_sent is still 0. Idempotent and
+     * best-effort: each send is wrapped, and the row's flags are stamped so it
+     * is never e-mailed twice.
+     *
+     * @param string|null $date  Y-m-d to process (defaults to today).
+     * @param int         $limit Max e-mails per call (drains across sweeps so one
+     *                           run never blocks on dozens of SMTP sends).
+     * @return int number of e-mails actually sent (or test-logged).
+     */
+    function sendPendingAbsentEmails(?string $date = null, int $limit = 40): int
+    {
+        if (defined('MAIL_ENABLED') && !MAIL_ENABLED) {
+            return 0;   // master switch off — respect it
+        }
+        if (!function_exists('notifyParentByEmail')) {
+            return 0;   // mailer not available
+        }
+
+        $pdo  = db();
+        $date = $date ?: (new DateTime('now',
+                    new DateTimeZone(date_default_timezone_get() ?: 'Asia/Manila')))->format('Y-m-d');
+        $sent = 0;
+
+        // Pull the absent rows that still need an e-mail, with everything the
+        // template needs (name, section, subject, teacher, schedule time, date).
+        // Parent name/e-mail come from correlated sub-queries so the join can't
+        // multiply rows when a student has several parent contacts.
+        $sql = "
+            SELECT
+                al.log_id, al.student_id, al.class_id, al.schedule_id,
+                s.full_name, s.student_number, s.section, s.email AS student_email,
+                c.course_code,
+                sub.subject_name,
+                sch.start_time, sch.end_time, sch.room,
+                COALESCE(t.name, u.full_name, 'TBA') AS teacher_name,
+                (SELECT pp.email FROM parents pp
+                   WHERE pp.student_id = s.id AND pp.email IS NOT NULL AND pp.email <> ''
+                   ORDER BY pp.parent_id LIMIT 1) AS parent_email,
+                (SELECT pp.parent_name FROM parents pp
+                   WHERE pp.student_id = s.id
+                   ORDER BY pp.parent_id LIMIT 1) AS parent_name
+            FROM attendance_logs al
+            JOIN students  s   ON s.id            = al.student_id
+            JOIN classes   c   ON c.class_id      = al.class_id
+            LEFT JOIN subjects  sub ON sub.course_code = c.course_code
+            LEFT JOIN schedules sch ON sch.schedule_id = al.schedule_id
+            LEFT JOIN teachers  t   ON t.id            = c.teacher_id
+            LEFT JOIN users     u   ON u.id            = t.user_id
+            WHERE al.action = 'absent'
+              AND al.attendance_status = 'absent'
+              AND al.email_sent = 0
+              AND DATE(al.logged_at) = :d
+            ORDER BY al.log_id
+            LIMIT {$limit}
+        ";
+        $st = $pdo->prepare($sql);
+        $st->execute([':d' => $date]);
+        $rows = $st->fetchAll();
+
+        foreach ($rows as $r) {
+            try {
+                $subjectName = $r['subject_name'] ?: ($r['course_code'] ?? '—');
+                $timeRange   = ($r['start_time'] && $r['end_time'])
+                    ? date('h:i A', strtotime($r['start_time'])) . ' – ' . date('h:i A', strtotime($r['end_time']))
+                    : '—';
+
+                $res = notifyParentByEmail([
+    'student_id'     => (int) $r['student_id'],
+    'log_id'         => (int) $r['log_id'],
+    'student_name'   => $r['full_name'],
+    'student_number' => $r['student_number'],
+    'parent_name'    => $r['parent_name']  ?? '',
+    'parent_email'   => $r['parent_email'] ?? '',
+    'student_email'  => $r['student_email'] ?? '',
+    'subject_name'   => $subjectName,
+    'subject_code'   => $r['course_code'] ?? '',
+    'teacher_name'   => $r['teacher_name'] ?? 'TBA',
+    'room'           => $r['room'] ?? 'TBA',
+    'section'        => $r['section'] ?? '',
+    'date_str'       => date('l, F j, Y', strtotime($date)),
+    'time_str'       => $timeRange,
+    'status_text'    => 'Absent',
+    'action'         => 'absent',
+    'is_late'        => false,
+    'school_name'    => defined('APP_NAME') ? APP_NAME : 'Student Attendance Monitoring System',
+
+    // Email debug data
+    'email_status'   => $res['status'] ?? '',
+    'email_error'    => $res['error'] ?? '',
+    'email_recipient'=> $res['recipient'] ?? '',
+]);
+
+error_log(
+    "📧 ABSENT EMAIL RESULT | Student ID: {$r['student_id']} | " .
+    "Status: " . ($res['status'] ?? 'unknown') . " | " .
+    "Error: " . ($res['error'] ?? 'none')
+);
+
+                $status = $res['status'] ?? 'failed';
+                $ok     = in_array($status, ['sent', 'test'], true);
+
+                // sent/test → mark e-mailed + notified.
+                // skipped (no e-mail on file / deduped) → mark handled so we
+                //         don't retry every sweep, but notification_sent stays 0.
+                // failed → leave email_sent=0 so a later sweep retries it.
+                if ($ok || $status === 'skipped') {
+                    $emailFlag = 1;                    // mark the row as handled either way
+                    $notifFlag = $ok ? 1 : 0;
+                    $pdo->prepare(
+                        "UPDATE attendance_logs SET email_sent = ?, notification_sent = ? WHERE log_id = ?"
+                    )->execute([$emailFlag, $notifFlag, (int) $r['log_id']]);
+                }
+                if ($ok) { $sent++; }
+            } catch (\Throwable $e) {
+                absentLog('absent e-mail to student ' . ($r['student_id'] ?? '?') . ' failed: ' . $e->getMessage());
+            }
+        }
+
+        if ($sent > 0) {
+            absentLog("Absent e-mails sent: {$sent} (date {$date}).");
+        }
+        return $sent;
     }
 }
 

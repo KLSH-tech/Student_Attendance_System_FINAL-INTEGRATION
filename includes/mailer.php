@@ -50,6 +50,20 @@ function sendMailSMTP(string $toEmail, string $toName, string $subject, string $
     while ($attempts < $maxTries) {
         $attempts++;
         $mail = new PHPMailer(true);
+        $mail->SMTPDebug = 2;
+$mail->Debugoutput = function ($str, $level) {
+    $logFile = __DIR__ . '/../logs/email_debug.log';
+
+    if (!file_exists(dirname($logFile))) {
+        mkdir(dirname($logFile), 0777, true);
+    }
+
+    file_put_contents(
+        $logFile,
+        '[' . date('Y-m-d H:i:s') . "] SMTP DEBUG: {$str}\n",
+        FILE_APPEND
+    );
+};
         try {
             $mail->isSMTP();
             $mail->Host       = SMTP_HOST;
@@ -65,6 +79,13 @@ function sendMailSMTP(string $toEmail, string $toName, string $subject, string $
                 $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
             }
             $mail->Timeout    = defined('MAIL_TIMEOUT') ? MAIL_TIMEOUT : 15;
+            $mail->SMTPOptions = [
+    'ssl' => [
+        'verify_peer' => false,
+        'verify_peer_name' => false,
+        'allow_self_signed' => true
+    ]
+];
             $mail->CharSet    = 'UTF-8';
 
             $mail->setFrom(MAIL_FROM, MAIL_FROM_NAME);
@@ -78,16 +99,38 @@ function sendMailSMTP(string $toEmail, string $toName, string $subject, string $
             $mail->Body    = $html;
             $mail->AltBody = $altText !== '' ? $altText : trim(strip_tags(str_replace(['<br>', '</p>', '</tr>'], "\n", $html)));
 
+            error_log("📧 Attempting SMTP send to: {$toEmail}");
             $mail->send();
             return ['ok' => true, 'attempts' => $attempts, 'error' => ''];
         } catch (MailException $e) {
-            $lastError = $mail->ErrorInfo ?: $e->getMessage();
-            error_log("📧 SMTP attempt {$attempts} failed for {$toEmail}: {$lastError}");
-            // brief pause before the single retry (skip on the last loop)
-            if ($attempts < $maxTries) {
-                usleep(400000); // 0.4s
-            }
-        }
+    $lastError = $mail->ErrorInfo ?: $e->getMessage();
+
+    $debugMessage = "\n================ EMAIL FAILURE ================\n";
+    $debugMessage .= "Time: " . date('Y-m-d H:i:s') . "\n";
+    $debugMessage .= "Recipient: {$toEmail}\n";
+    $debugMessage .= "Subject: {$subject}\n";
+    $debugMessage .= "Attempt: {$attempts}\n";
+    $debugMessage .= "SMTP Host: " . SMTP_HOST . "\n";
+    $debugMessage .= "SMTP Port: " . SMTP_PORT . "\n";
+    $debugMessage .= "SMTP Secure: " . SMTP_SECURE . "\n";
+    $debugMessage .= "SMTP User: " . SMTP_USER . "\n";
+    $debugMessage .= "Error: {$lastError}\n";
+    $debugMessage .= "===============================================\n\n";
+
+    error_log($debugMessage);
+
+    $logFile = __DIR__ . '/../logs/email_errors.log';
+
+    if (!file_exists(dirname($logFile))) {
+        mkdir(dirname($logFile), 0777, true);
+    }
+
+    file_put_contents($logFile, $debugMessage, FILE_APPEND);
+
+    if ($attempts < $maxTries) {
+        usleep(400000);
+    }
+}
     }
     return ['ok' => false, 'attempts' => $attempts, 'error' => $lastError];
 }
@@ -112,9 +155,16 @@ function buildAttendanceEmail(array $d): array
     $timeStr  = e($d['time_str']      ?? '');
     $action   = ($d['action'] ?? 'in') === 'out' ? 'out' : 'in';
     $isLate   = !empty($d['is_late']);
+    // ABSENT e-mails reuse this same template (requirement: notify like Present/Late).
+    $isAbsent = (($d['action'] ?? '') === 'absent')
+             || (strtolower((string)($d['status_text'] ?? '')) === 'absent');
 
     // Status colour + label
-    if ($action === 'out') {
+    if ($isAbsent) {
+        $accent = '#b91c1c'; $bg = '#dc2626'; $scanType = 'ABSENT';
+        $statusText = $d['status_text'] ?? 'Absent';
+        $headline   = 'was marked ABSENT (no scan within the grace period)';
+    } elseif ($action === 'out') {
         $accent = '#475569'; $bg = '#475569'; $scanType = 'TIME OUT';
         $statusText = $d['status_text'] ?? 'Checked Out';
         $headline   = 'has checked OUT';
@@ -203,11 +253,15 @@ HTML;
  *    Resolves recipient, de-duplicates, sends, and logs to `email_log`.
  *    Returns ['status'=>'sent|failed|skipped|test','recipient'=>..,'error'=>..].
  * ------------------------------------------------------------------------- */
+error_log("📧 notifyParentByEmail triggered for student ID: " . ($ctx['student_id'] ?? 'unknown'));
 function notifyParentByEmail(array $ctx): array
 {
     $pdo       = db();
     $studentId = (int)($ctx['student_id'] ?? 0);
-    $action    = ($ctx['action'] ?? 'in') === 'out' ? 'out' : 'in';
+    // Preserve 'absent' (alongside 'in'/'out') so absence e-mails dedup and log
+    // under their own action bucket instead of being mistaken for a time-in.
+    $rawAction = (string)($ctx['action'] ?? 'in');
+    $action    = in_array($rawAction, ['in', 'out', 'absent'], true) ? $rawAction : 'in';
     $logId     = isset($ctx['log_id']) ? (int)$ctx['log_id'] : null;
 
     // ── Resolve recipient: parent e-mail first, student e-mail as fallback ──
@@ -225,7 +279,7 @@ function notifyParentByEmail(array $ctx): array
         $recipientType = 'student';
     }
 
-    if ($recipient === '') {
+    if ($recipient === '') { error_log("❌ No valid parent email found for student ID {$studentId}");
         logEmailAttempt($pdo, $studentId, $logId, '', $recipientType, '',
             $action, $ctx['status_text'] ?? '', 'skipped', 'No valid e-mail on file', 0);
         return ['status' => 'skipped', 'recipient' => '', 'error' => 'No valid e-mail on file'];
@@ -258,6 +312,7 @@ function notifyParentByEmail(array $ctx): array
     logEmailAttempt($pdo, $studentId, $logId, $recipient, $recipientType, $built['subject'],
         $action, $ctx['status_text'] ?? '', $status, $error, $attempts);
 
+        error_log("📧 Email result: {$status} | Recipient: {$recipient} | Error: {$error}");
     return ['status' => $status, 'recipient' => $recipient, 'error' => $error];
 }
 
